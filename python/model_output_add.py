@@ -190,7 +190,8 @@ def test():
                         help='Use simple sequential input data instead of random')
     
     args = parser.parse_args()
-    
+    core = ov.Core()
+    print(f"Using OpenVINO version: {ov.get_version()}")
     # Decide which model to use based on whether model path is provided
     if args.input:
         if not os.path.exists(args.input):
@@ -198,7 +199,7 @@ def test():
             return
         
         print(f"Loading model from: {args.input}")
-        model = ov.read_model(args.input)
+        model = core.read_model(args.input)
         print("Model loaded successfully!")
     else:
         print("No input model specified, using default generated model...")
@@ -206,7 +207,7 @@ def test():
 
     # Display original model information
     print("\n=== Original Model Info ===")
-    common_utils.print_model_info(model)
+    # common_utils.print_model_info(model)
 
     # If compare mode is enabled, run CPU vs GPU comparison
     if args.compare:
