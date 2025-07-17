@@ -264,8 +264,8 @@ def test():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Add new output to OpenVINO model')
     parser.add_argument('-i', '--input', type=str, help='Path to input model file (.xml)')
-    parser.add_argument('-o', '--output_node', type=str, nargs='*', default=['op_add'], 
-                        help='Name(s) of the node(s) to add as new output (default: op_add). Can specify multiple nodes separated by spaces.')
+    parser.add_argument('-o', '--output_node', type=str, nargs='*', default=[], 
+                        help='Name(s) of the node(s) to add as new output. Can specify multiple nodes separated by spaces.')
     parser.add_argument('-d', '--device', type=str, default='CPU', 
                         help='Device to run inference on (default: CPU)')
     parser.add_argument('--compare', action='store_true', 
@@ -332,7 +332,7 @@ def test():
     if args.simple_input:
         input_data = create_simple_test_input(input_shape)
     else:
-        input_data = np.random.uniform(low=0, high=1.0, size=input_shape).astype(np.float32)
+        input_data = np.random.uniform(low=0, high=255, size=input_shape).astype(np.float32)
 
     # Run inference
     print("\n=== Running inference...")
