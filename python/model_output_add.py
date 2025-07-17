@@ -10,7 +10,7 @@ import os
 def my_model():
     input = opset.parameter([1, 256, 32, 32], Type.f32, name='input')
 
-    weight_arr = np.random.uniform(low=-1, high=1.0, size=[1024,256,1,1]).astype(np.float32)
+    weight_arr = np.full([1024,256,1,1], 1.5, dtype=np.float32)
     weight = opset.constant(weight_arr, Type.f32, name='weight')
 
     strides = [1, 1]
@@ -19,42 +19,77 @@ def my_model():
     dilations = [1, 1]
     conv = opset.convolution(input, weight, strides, pads_begin, pads_end, dilations)
 
-    add = opset.add(conv, np.random.uniform(low=-1, high=1.0, size=[1,1024,1,1]).astype(np.float32), name='op_add')
+    add = opset.add(conv, np.full([1,1024,1,1], 1, dtype=np.float32), name='op_add')
 
-    op_gelu = opset.gelu(add, approximation_mode="ERF")
+    #op_gelu = opset.gelu(add, approximation_mode="ERF")
  
-    Result = opset.result(op_gelu, name='output')
-    return Model([Result], [input], 'model_gelu')
+    #Result = opset.result(op_gelu, name='output')
+    Result = opset.result(add, name='output')
+    Result.output(0).set_names({'output'})
+    return Model([Result], [input], 'model_add')
 
-def add_new_output(ov_model:ov.Model, name):
-    found_node_output = None
+def add_new_output(ov_model: ov.Model, name_list):
+    """
+    Add new outputs to the model for specified nodes.
     
-    print(f"\nSearching for node with name: '{name}'")
+    Args:
+        ov_model: OpenVINO model
+        name_list: List of node names to add as outputs, or single string name
+    
+    Returns:
+        Modified model with new outputs
+    """
+    # Convert single string to list for uniform processing
+    if isinstance(name_list, str):
+        name_list = [name_list]
+    
+    if not name_list:
+        print("No node names provided, skipping output addition.")
+        return ov_model
+    
+    print(f"\nSearching for nodes with names: {name_list}")
     available_nodes = []
+    added_count = 0
     
-    for op in ov_model.get_ordered_ops():
+    # Get all available nodes for error reporting
+    all_ops = ov_model.get_ordered_ops()
+    for op in all_ops:
         available_nodes.append(op.get_friendly_name())
-        if op.get_friendly_name() == name:
-            # Assuming op has one output, take its first output port
-            found_node_output = op.output(0)
-            print(f"Found target node: '{name}' with type '{op.get_type_name()}'")
-            break
+    
+    # Search for each requested node
+    for name in name_list:
+        found_node_output = None
+        
+        for op in all_ops:
+            if op.get_friendly_name() == name:
+                # Assuming op has one output, take its first output port
+                found_node_output = op.output(0)
+                print(f"Found target node: '{name}' with type '{op.get_type_name()}'")
+                break
 
-    new_output_name = name + "_output"
-    if found_node_output:
-        # Create a new Result node connected to the found output
-        new_result = ov.opset12.result(found_node_output)
-        new_result.set_friendly_name(new_output_name) # Set a friendly name
-        new_result.output(0).set_names({new_output_name}) # Set tensor names
+        new_output_name = name + "_output"
+        if found_node_output:
+            try:
+                # Create a new Result node connected to the found output
+                new_result = ov.opset12.result(found_node_output)
+                new_result.set_friendly_name(new_output_name) # Set a friendly name
+                new_result.output(0).set_names({new_output_name}) # Set tensor names
 
-        # Add the new result node to the model's outputs
-        ov_model.add_results([new_result])
-        print(f"== Added new output: {new_output_name}")
-    else:
-        print(f"== Error: Could not find node '{name}' to add as a new output.")
+                # Add the new result node to the model's outputs
+                ov_model.add_results([new_result])
+                print(f"== Added new output: {new_output_name}")
+                added_count += 1
+            except Exception as e:
+                print(f"== Error: Failed to add output for '{name}': {e}")
+        else:
+            print(f"== Error: Could not find node '{name}' to add as a new output.")
+    
+    if added_count == 0:
         print(f"Available nodes: {available_nodes[:10]}...")  # Show first 10 available nodes
         if len(available_nodes) > 10:
             print(f"... and {len(available_nodes) - 10} more nodes")
+    else:
+        print(f"Successfully added {added_count} new outputs from {len(name_list)} requested nodes.")
 
     return ov_model
 
@@ -62,40 +97,28 @@ def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5):
     """Compare outputs of all layers between CPU and GPU devices"""
     print("\n=== Comparing CPU vs GPU outputs for all layers ===")
     
-    # Get all operation nodes that can be used as outputs
-    all_ops = ov_model.get_ordered_ops()
+    # Collect all model outputs for comparison
+    outputs_info = []
+    print(f"=== Model Outputs ===")
+    for i, output in enumerate(ov_model.outputs):
+        output_name = list(output.get_names())[0] if output.get_names() else output.get_any_name()
+        source_op = output.get_node()
+        outputs_info.append((source_op.get_friendly_name(), output_name, source_op.get_type_name()))
+        print(f"  Output {i}: {output_name} (from {source_op.get_friendly_name()}, type: {source_op.get_type_name()})")
     
-    # Create a copy of the model to add multiple outputs
-    model_with_all_outputs = ov_model
-    
-    # Add all intermediate layers as outputs for comparison
-    added_outputs = []
-    for i, op in enumerate(all_ops):
-        if op.get_output_size() > 0 and op.get_type_name() not in ['Parameter', 'Constant', 'Result']:
-            try:
-                output_name = f"{op.get_friendly_name()}_debug_output"
-                new_result = ov.opset12.result(op.output(0))
-                new_result.set_friendly_name(output_name)
-                new_result.output(0).set_names({output_name})
-                model_with_all_outputs.add_results([new_result])
-                added_outputs.append((op.get_friendly_name(), output_name, op.get_type_name()))
-                print(f"  Added debug output for: {op.get_friendly_name()} (type: {op.get_type_name()})")
-            except Exception as e:
-                print(f"  Warning: Could not add output for {op.get_friendly_name()}: {e}")
-    
-    print(f"\nTotal debug outputs added: {len(added_outputs)}")
-    
+    print(f"\nTotal outputs for comparison: {len(outputs_info)}")
+
     # Compile for CPU and GPU
     print("\nCompiling models...")
     try:
-        cm_cpu = ov.compile_model(model_with_all_outputs, "CPU")
+        cm_cpu = ov.compile_model(ov_model, "CPU", {"INFERENCE_PRECISION_HINT": "FP32"})
         print("✓ CPU compilation successful")
     except Exception as e:
         print(f"✗ CPU compilation failed: {e}")
         return
     
     try:
-        cm_gpu = ov.compile_model(model_with_all_outputs, "GPU")
+        cm_gpu = ov.compile_model(ov_model, "GPU", {"INFERENCE_PRECISION_HINT": "FP32"})
         print("✓ GPU compilation successful")
     except Exception as e:
         print(f"✗ GPU compilation failed: {e}")
@@ -107,11 +130,45 @@ def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5):
     cpu_outputs = cm_cpu(input_data)
     gpu_outputs = cm_gpu(input_data)
     
+    # Debug: Print all available output names
+    print(f"\n=== Debug: Available CPU output names ===")
+    for name in cpu_outputs.keys():
+        print(f"  CPU output: '{name}' (type: {type(name)})")
+    
+    print(f"\n=== Debug: Available GPU output names ===")
+    for name in gpu_outputs.keys():
+        print(f"  GPU output: '{name}' (type: {type(name)})")
+    
+    print(f"\n=== Debug: Expected output names from outputs_info ===")
+    for layer_name, output_name, layer_type in outputs_info:
+        print(f"  Expected: '{output_name}' (from {layer_name}, type: {layer_type})")
+    
+    # Debug: Try to extract actual tensor names from the ConstOutput objects
+    print(f"\n=== Debug: Extracting tensor names ===")
+    actual_cpu_names = []
+    for key in cpu_outputs.keys():
+        if hasattr(key, 'get_names'):
+            names = key.get_names()
+            actual_cpu_names.extend(names)
+            print(f"  CPU key '{key}' has tensor names: {list(names)}")
+        else:
+            print(f"  CPU key '{key}' is a simple string")
+    
+    actual_gpu_names = []
+    for key in gpu_outputs.keys():
+        if hasattr(key, 'get_names'):
+            names = key.get_names()
+            actual_gpu_names.extend(names)
+            print(f"  GPU key '{key}' has tensor names: {list(names)}")
+        else:
+            print(f"  GPU key '{key}' is a simple string")
+    
     # Compare outputs
-    print(f"\n=== Layer-by-layer comparison (tolerance: {tolerance}) ===")
+    print(f"\n=== Output Comparison (tolerance: {tolerance}) ===")
     mismatched_layers = []
     
-    for layer_name, output_name, layer_type in added_outputs:
+    for layer_name, output_name, layer_type in outputs_info:
+        print(f" =====   output name: {output_name} ======")
         if output_name in cpu_outputs and output_name in gpu_outputs:
             cpu_out = cpu_outputs[output_name]
             gpu_out = gpu_outputs[output_name]
@@ -124,18 +181,22 @@ def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5):
             # Check if difference exceeds tolerance
             is_mismatch = max_diff > tolerance
             
+            # Use unified formatting for all outputs
             status = "❌ MISMATCH" if is_mismatch else "✅ MATCH"
             print(f"{status} {layer_name:20s} ({layer_type:15s}) | Max diff: {max_diff:.2e} | Mean diff: {mean_diff:.2e}")
             
+            # Track mismatches
             if is_mismatch:
-                mismatched_layers.append({
+                mismatch_info = {
                     'name': layer_name,
+                    'output_name': output_name,
                     'type': layer_type,
                     'max_diff': max_diff,
                     'mean_diff': mean_diff,
                     'cpu_shape': cpu_out.shape,
                     'gpu_shape': gpu_out.shape
-                })
+                }
+                mismatched_layers.append(mismatch_info)
                 
                 # Show some sample values for mismatched layers
                 print(f"    CPU sample values: {cpu_out.flatten()[:5]}")
@@ -143,29 +204,55 @@ def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5):
     
     # Summary
     print(f"\n=== Summary ===")
-    print(f"Total layers compared: {len(added_outputs)}")
-    print(f"Mismatched layers: {len(mismatched_layers)}")
+    print(f"Total outputs compared: {len(outputs_info)}")
+    print(f"Total mismatched outputs: {len(mismatched_layers)}")
     
-    if mismatched_layers:
-        print("\nLayers with significant differences:")
-        for layer in mismatched_layers:
+    debug_mismatches = [x for x in mismatched_layers if x['type'] != "Result"]
+    if debug_mismatches:
+        print("\n⚠️  Debug outputs with differences:")
+        for layer in debug_mismatches:
             print(f"  - {layer['name']} ({layer['type']}): max_diff={layer['max_diff']:.2e}")
-    else:
-        print("All layers match within tolerance!")
+    
+    if not mismatched_layers:
+        print("✅ All outputs match within tolerance!")
     
     return mismatched_layers
+
+def add_all_debug_outputs(ov_model: ov.Model):
+    """Add all intermediate layers as debug outputs to the model"""
+    print("\n=== Adding Debug Outputs to Model ===")
+    
+    # Get all operation nodes that can be used as outputs
+    all_ops = ov_model.get_ordered_ops()
+    added_count = 0
+    
+    for i, op in enumerate(all_ops):
+        if op.get_output_size() > 0 and op.get_type_name() not in ['Parameter', 'Constant', 'Result']:
+            try:
+                output_name = f"{op.get_friendly_name()}_debug_output"
+                new_result = ov.opset12.result(op.output(0))
+                new_result.set_friendly_name(output_name)
+                new_result.output(0).set_names({output_name})
+                ov_model.add_results([new_result])
+                added_count += 1
+                print(f"  Added debug output for: {op.get_friendly_name()} (type: {op.get_type_name()})")
+            except Exception as e:
+                print(f"  Warning: Could not add output for {op.get_friendly_name()}: {e}")
+    
+    print(f"Successfully added {added_count} debug outputs to the model")
+    return ov_model
 
 def create_simple_test_input(input_shape):
     """Create simple test input data for debugging"""
     print(f"\nCreating simple test input with shape: {input_shape}")
     
     # Option 1: All ones
-    # input_data = np.ones(input_shape, dtype=np.float32)
+    input_data = np.ones(input_shape, dtype=np.float32)
     
     # Option 2: Sequential values (more likely to reveal differences)
-    total_elements = np.prod(input_shape)
-    input_data = np.arange(total_elements, dtype=np.float32).reshape(input_shape)
-    input_data = input_data / total_elements  # Normalize to [0, 1] range
+    # total_elements = np.prod(input_shape)
+    # input_data = np.arange(total_elements, dtype=np.float32).reshape(input_shape)
+    # input_data = input_data / total_elements  # Normalize to [0, 1] range
     
     # Option 3: Small random values with fixed seed for reproducibility
     # np.random.seed(42)
@@ -178,8 +265,8 @@ def test():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Add new output to OpenVINO model')
     parser.add_argument('-i', '--input', type=str, help='Path to input model file (.xml)')
-    parser.add_argument('-o', '--output_node', type=str, default='op_add', 
-                        help='Name of the node to add as new output (default: op_add)')
+    parser.add_argument('-o', '--output_node', type=str, nargs='*', default=['op_add'], 
+                        help='Name(s) of the node(s) to add as new output (default: op_add). Can specify multiple nodes separated by spaces.')
     parser.add_argument('-d', '--device', type=str, default='CPU', 
                         help='Device to run inference on (default: CPU)')
     parser.add_argument('--compare', action='store_true', 
@@ -192,6 +279,7 @@ def test():
     args = parser.parse_args()
     core = ov.Core()
     print(f"Using OpenVINO version: {ov.get_version()}")
+    
     # Decide which model to use based on whether model path is provided
     if args.input:
         if not os.path.exists(args.input):
@@ -205,12 +293,20 @@ def test():
         print("No input model specified, using default generated model...")
         model = my_model()
 
+
+    # Add the specified output nodes if provided
+    if args.output_node:
+        print(f"Adding specified output nodes: {args.output_node}")
+        model = add_new_output(model, args.output_node)
+
     # Display original model information
     print("\n=== Original Model Info ===")
-    # common_utils.print_model_info(model)
+    common_utils.print_model_info(model)
 
-    # If compare mode is enabled, run CPU vs GPU comparison
+    # If compare mode is enabled, prepare model with debug outputs and run comparison
     if args.compare:
+        print("\n=== Preparing model for CPU vs GPU comparison ===")
+        # Prepare test input
         input_shape = model.input(0).get_shape()
         print(f"\n=== Preparing test input for comparison ===")
         
@@ -223,36 +319,36 @@ def test():
         # Run comparison
         mismatched_layers = compare_cpu_gpu_outputs(model, input_data, args.tolerance)
         
-        # Exit after comparison unless user wants to continue
+        # Exit after comparison
         return
-
-    # Compile model
-    # print(f"\n=== Compiling model for device: {args.device}")
-    # cm = ov.compile_model(model, args.device)
-
-    # # Prepare input data
-    # input_shape = model.input(0).get_shape()
-    # print(f"\n=== Preparing input data with shape: {input_shape}")
     
-    # if args.simple_input:
-    #     input_data = create_simple_test_input(input_shape)
-    # else:
-    #     input_data = np.random.uniform(low=0, high=1.0, size=input_shape).astype(np.float32)
+    # Compile model
+    print(f"\n=== Compiling model for device: {args.device}")
+    cm = ov.compile_model(model, args.device)
+
+    # Prepare input data
+    input_shape = model.input(0).get_shape()
+    print(f"\n=== Preparing input data with shape: {input_shape}")
+    
+    if args.simple_input:
+        input_data = create_simple_test_input(input_shape)
+    else:
+        input_data = np.random.uniform(low=0, high=1.0, size=input_shape).astype(np.float32)
 
     # Run inference
-    # print("\n=== Running inference...")
-    # output = cm(input_data)
+    print("\n=== Running inference...")
+    output = cm(input_data)
     
-    # # Display output results
-    # print(f"\n=== Inference results:")
-    # print(f"=== Number of outputs: {len(output)}")
+    # Display output results
+    print(f"\n=== Inference results:")
+    print(f"=== Number of outputs: {len(output)}")
     
-    # for i, (key, value) in enumerate(output.items()):
-    #     print(f"===\t Output {i}: key='{key}', shape={value.shape}")
-    #     # Display first 10 values of each output
-    #     flat_values = value.flatten()
-    #     num_values_to_show = min(10, len(flat_values))
-    #     print(f"===\t First {num_values_to_show} values: {flat_values[:num_values_to_show]}")
+    for i, (key, value) in enumerate(output.items()):
+        print(f"===\t Output {i}: key='{key}', shape={value.shape}")
+        # Display first 10 values of each output
+        flat_values = value.flatten()
+        num_values_to_show = min(10, len(flat_values))
+        print(f"===\t First {num_values_to_show} values: {flat_values[:num_values_to_show]}")
     
 if __name__ ==  "__main__":
     test()
