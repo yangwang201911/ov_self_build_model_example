@@ -21,10 +21,9 @@ def my_model():
 
     add = opset.add(conv, np.full([1,1024,1,1], 1, dtype=np.float32), name='op_add')
 
-    #op_gelu = opset.gelu(add, approximation_mode="ERF")
+    op_gelu = opset.gelu(add, approximation_mode="ERF")
  
-    #Result = opset.result(op_gelu, name='output')
-    Result = opset.result(add, name='output')
+    Result = opset.result(op_gelu, name='output')
     Result.output(0).set_names({'output'})
     return Model([Result], [input], 'model_add')
 
