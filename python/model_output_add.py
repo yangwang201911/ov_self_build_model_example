@@ -129,44 +129,15 @@ def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5):
     cpu_outputs = cm_cpu(input_data)
     gpu_outputs = cm_gpu(input_data)
     
-    # Debug: Print all available output names
-    print(f"\n=== Debug: Available CPU output names ===")
-    for name in cpu_outputs.keys():
-        print(f"  CPU output: '{name}' (type: {type(name)})")
-    
-    print(f"\n=== Debug: Available GPU output names ===")
-    for name in gpu_outputs.keys():
-        print(f"  GPU output: '{name}' (type: {type(name)})")
-    
     print(f"\n=== Debug: Expected output names from outputs_info ===")
     for layer_name, output_name, layer_type in outputs_info:
         print(f"  Expected: '{output_name}' (from {layer_name}, type: {layer_type})")
-    
-    # Debug: Try to extract actual tensor names from the ConstOutput objects
-    print(f"\n=== Debug: Extracting tensor names ===")
-    actual_cpu_names = []
-    for key in cpu_outputs.keys():
-        if hasattr(key, 'get_names'):
-            names = key.get_names()
-            actual_cpu_names.extend(names)
-            print(f"  CPU key '{key}' has tensor names: {list(names)}")
-        else:
-            print(f"  CPU key '{key}' is a simple string")
-    
-    actual_gpu_names = []
-    for key in gpu_outputs.keys():
-        if hasattr(key, 'get_names'):
-            names = key.get_names()
-            actual_gpu_names.extend(names)
-            print(f"  GPU key '{key}' has tensor names: {list(names)}")
-        else:
-            print(f"  GPU key '{key}' is a simple string")
     
     # Compare outputs
     print(f"\n=== Output Comparison (tolerance: {tolerance}) ===")
     mismatched_layers = []
     
-    for layer_name, output_name, layer_type in outputs_info:
+    for idx, (layer_name, output_name, layer_type) in enumerate(outputs_info, 1):
         print(f" =====   output name: {output_name} ======")
         if output_name in cpu_outputs and output_name in gpu_outputs:
             cpu_out = cpu_outputs[output_name]
@@ -182,7 +153,7 @@ def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5):
             
             # Use unified formatting for all outputs
             status = "❌ MISMATCH" if is_mismatch else "✅ MATCH"
-            print(f"{status} {layer_name:20s} ({layer_type:15s}) | Max diff: {max_diff:.2e} | Mean diff: {mean_diff:.2e}")
+            print(f"[{idx:3d}] {status} {layer_name:20s} ({layer_type:15s}) | Max diff: {max_diff:.2e} | Mean diff: {mean_diff:.2e}")
             
             # Track mismatches
             if is_mismatch:
@@ -217,26 +188,58 @@ def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5):
     
     return mismatched_layers
 
-def add_all_debug_outputs(ov_model: ov.Model):
-    """Add all intermediate layers as debug outputs to the model"""
-    print("\n=== Adding Debug Outputs to Model ===")
+def add_all_debug_outputs(ov_model: ov.Model, percentage=100):
+    """Add intermediate layers as debug outputs to the model
+    
+    Args:
+        ov_model: OpenVINO model
+        percentage: Percentage of eligible nodes to add as outputs (1-100)
+                   Selects the first N% of nodes in model execution order
+    
+    Note:
+        Skips Parameter, Constant, Result, and all Convolution-related nodes (nodes with type starting with 'conv')
+    """
+    print(f"\n=== Adding Debug Outputs to Model (first {percentage}% of eligible nodes) ===")
     
     # Get all operation nodes that can be used as outputs
     all_ops = ov_model.get_ordered_ops()
-    added_count = 0
+    eligible_ops = []
     
-    for i, op in enumerate(all_ops):
-        if op.get_output_size() > 0 and op.get_type_name() not in ['Parameter', 'Constant', 'Result']:
-            try:
-                output_name = f"{op.get_friendly_name()}_debug_output"
-                new_result = ov.opset12.result(op.output(0))
-                new_result.set_friendly_name(output_name)
-                new_result.output(0).set_names({output_name})
-                ov_model.add_results([new_result])
-                added_count += 1
-                print(f"  Added debug output for: {op.get_friendly_name()} (type: {op.get_type_name()})")
-            except Exception as e:
-                print(f"  Warning: Could not add output for {op.get_friendly_name()}: {e}")
+    # Filter eligible operations
+    for op in all_ops:
+        if (op.get_output_size() > 0 and op.get_type_name() not in ['Parameter', 'Constant', 'Result', 'Convolution']):
+            eligible_ops.append(op)
+    
+    print(f"Found {len(eligible_ops)} eligible nodes for debug outputs")
+    
+    # Calculate how many nodes to add based on percentage
+    if percentage <= 0 or percentage > 100:
+        print(f"Warning: Invalid percentage {percentage}%. Using 100%")
+        percentage = 100
+    
+    num_to_add = max(1, int(len(eligible_ops) * percentage / 100))
+    print(f"Will add debug outputs for the first {num_to_add} nodes ({percentage}%)")
+    
+    # Select nodes to add (first N% of nodes)
+    if percentage >= 100:
+        selected_ops = eligible_ops
+    else:
+        # Select the first N% of nodes based on their order in the model
+        selected_ops = eligible_ops[:num_to_add]
+    
+    # Add debug outputs for selected nodes
+    added_count = 0
+    for idx, op in enumerate(selected_ops, 1):
+        try:
+            output_name = f"{op.get_friendly_name()}_debug_output"
+            new_result = ov.opset12.result(op.output(0))
+            new_result.set_friendly_name(output_name)
+            new_result.output(0).set_names({output_name})
+            ov_model.add_results([new_result])
+            added_count += 1
+            print(f"  [{idx:2d}] Added debug output for: {op.get_friendly_name()} (type: {op.get_type_name()})")
+        except Exception as e:
+            print(f"  [{idx:2d}] Warning: Could not add output for {op.get_friendly_name()}: {e}")
     
     print(f"Successfully added {added_count} debug outputs to the model")
     return ov_model
@@ -270,6 +273,8 @@ def test():
                         help='Device to run inference on (default: CPU)')
     parser.add_argument('--compare', action='store_true', 
                         help='Compare CPU vs GPU outputs for all layers')
+    parser.add_argument('--debug-percentage', type=float, default=None,
+                        help='Percentage of eligible nodes to add as debug outputs (1-100). Selects the first N%% of nodes in execution order. If not specified, no debug outputs will be added.')
     parser.add_argument('--tolerance', type=float, default=1e-5,
                         help='Tolerance for CPU vs GPU comparison (default: 1e-5)')
     parser.add_argument('--simple-input', action='store_true',
@@ -305,6 +310,13 @@ def test():
     # If compare mode is enabled, prepare model with debug outputs and run comparison
     if args.compare:
         print("\n=== Preparing model for CPU vs GPU comparison ===")
+        
+        # Add debug outputs only if percentage is specified
+        if args.debug_percentage is not None:
+            model = add_all_debug_outputs(model, args.debug_percentage)
+        else:
+            print("No debug percentage specified, skipping debug output addition.")
+        
         # Prepare test input
         input_shape = model.input(0).get_shape()
         print(f"\n=== Preparing test input for comparison ===")
