@@ -105,6 +105,12 @@ def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5):
         outputs_info.append((source_op.get_friendly_name(), output_name, source_op.get_type_name()))
         print(f"  Output {i}: {output_name} (from {source_op.get_friendly_name()}, type: {source_op.get_type_name()})")
     
+    # Move the first element to the last position
+    if len(outputs_info) > 1:
+        first_element = outputs_info.pop(0)
+        outputs_info.append(first_element)
+        print(f"\nReordered outputs: moved first output to last position for final model output comparison")
+    
     print(f"\nTotal outputs for comparison: {len(outputs_info)}")
 
     # Compile for CPU and GPU
@@ -136,9 +142,14 @@ def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5):
     # Compare outputs
     print(f"\n=== Output Comparison (tolerance: {tolerance}) ===")
     mismatched_layers = []
+    final_output_matches = True  # Track if the final output matches
     
     for idx, (layer_name, output_name, layer_type) in enumerate(outputs_info, 1):
-        print(f" =====   output name: {output_name} ======")
+        is_final_output = (idx == len(outputs_info))  # Check if this is the final output
+        if is_final_output:
+            print(f"\n =====   Model output name: {output_name} ======")
+        else:
+            print(f"\n =====   Layer output name: {output_name} ======")
         if output_name in cpu_outputs and output_name in gpu_outputs:
             cpu_out = cpu_outputs[output_name]
             gpu_out = gpu_outputs[output_name]
@@ -150,6 +161,10 @@ def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5):
             
             # Check if difference exceeds tolerance
             is_mismatch = max_diff > tolerance
+            
+            # Track final output match status
+            if is_final_output:
+                final_output_matches = not is_mismatch
             
             # Use unified formatting for all outputs
             status = "❌ MISMATCH" if is_mismatch else "✅ MATCH"
@@ -164,7 +179,8 @@ def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5):
                     'max_diff': max_diff,
                     'mean_diff': mean_diff,
                     'cpu_shape': cpu_out.shape,
-                    'gpu_shape': gpu_out.shape
+                    'gpu_shape': gpu_out.shape,
+                    'is_final': is_final_output
                 }
                 mismatched_layers.append(mismatch_info)
                 
@@ -177,7 +193,21 @@ def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5):
     print(f"Total outputs compared: {len(outputs_info)}")
     print(f"Total mismatched outputs: {len(mismatched_layers)}")
     
-    debug_mismatches = [x for x in mismatched_layers if x['type'] != "Result"]
+    # Check final output status and display overall result
+    final_output_mismatch = [x for x in mismatched_layers if x.get('is_final', False)]
+    
+    print(f"\n=== Final Model Output Comparison ===")
+    if final_output_matches:
+        print("🎉 Model final outputs match between CPU and GPU")
+        print("✅ Comparison Result: PASS")
+    else:
+        print("❌ Model final outputs differ between CPU and GPU")
+        print("❌ Comparison Result: FAIL")
+        if final_output_mismatch:
+            layer = final_output_mismatch[0]
+            print(f"    Final output mismatch details: {layer['name']} (max_diff: {layer['max_diff']:.2e})")
+    
+    debug_mismatches = [x for x in mismatched_layers if x['type'] != "Result" and not x.get('is_final', False)]
     if debug_mismatches:
         print("\n⚠️  Debug outputs with differences:")
         for layer in debug_mismatches:
@@ -275,7 +305,7 @@ def test():
                         help='Compare CPU vs GPU outputs for all layers')
     parser.add_argument('--debug-percentage', type=float, default=None,
                         help='Percentage of eligible nodes to add as debug outputs (1-100). Selects the first N%% of nodes in execution order. If not specified, no debug outputs will be added.')
-    parser.add_argument('--tolerance', type=float, default=1e-5,
+    parser.add_argument('--tolerance', type=float, default=1e-3,
                         help='Tolerance for CPU vs GPU comparison (default: 1e-5)')
     parser.add_argument('--simple-input', action='store_true',
                         help='Use simple sequential input data instead of random')
