@@ -146,10 +146,20 @@ def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5):
     
     for idx, (layer_name, output_name, layer_type) in enumerate(outputs_info, 1):
         is_final_output = (idx == len(outputs_info))  # Check if this is the final output
+        
+        # Extract node order from output name if it's a debug output
+        node_order_info = ""
+        if "_debug_output_node" in output_name:
+            try:
+                node_num = output_name.split("_debug_output_node")[1]
+                node_order_info = f" (Model Node #{node_num})"
+            except:
+                pass
+        
         if is_final_output:
-            print(f"\n =====   Model output name: {output_name} ======")
+            print(f"\n =====   Model output name: {output_name}{node_order_info} ======")
         else:
-            print(f"\n =====   Layer output name: {output_name} ======")
+            print(f"\n =====   Layer output name: {output_name}{node_order_info} ======")
         if output_name in cpu_outputs and output_name in gpu_outputs:
             cpu_out = cpu_outputs[output_name]
             gpu_out = gpu_outputs[output_name]
@@ -168,7 +178,7 @@ def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5):
             
             # Use unified formatting for all outputs
             status = "❌ MISMATCH" if is_mismatch else "✅ MATCH"
-            print(f"[{idx:3d}] {status} {layer_name:20s} ({layer_type:15s}) | Max diff: {max_diff:.2e} | Mean diff: {mean_diff:.2e}")
+            print(f"[{idx:3d}] {status} {layer_name:20s} ({layer_type:15s}){node_order_info} | Max diff: {max_diff:.2e} | Mean diff: {mean_diff:.2e}")
             
             # Track mismatches
             if is_mismatch:
@@ -180,13 +190,38 @@ def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5):
                     'mean_diff': mean_diff,
                     'cpu_shape': cpu_out.shape,
                     'gpu_shape': gpu_out.shape,
-                    'is_final': is_final_output
+                    'is_final': is_final_output,
+                    'node_order': node_order_info
                 }
                 mismatched_layers.append(mismatch_info)
                 
-                # Show some sample values for mismatched layers
-                print(f"    CPU sample values: {cpu_out.flatten()[:5]}")
-                print(f"    GPU sample values: {gpu_out.flatten()[:5]}")
+                # Find and show the location and values with largest deviations
+                flat_cpu = cpu_out.flatten()
+                flat_gpu = gpu_out.flatten()
+                flat_diff = np.abs(flat_cpu - flat_gpu)
+                
+                # Find indices of top 3 largest differences
+                top_diff_indices = np.argsort(flat_diff)[-3:][::-1]  # Get top 3, reverse to largest first
+                
+                print(f"    Top {len(top_diff_indices)} largest deviations:")
+                for i, idx in enumerate(top_diff_indices, 1):
+                    deviation = flat_diff[idx]
+                    cpu_val = flat_cpu[idx]
+                    gpu_val = flat_gpu[idx]
+                    
+                    # Show neighboring values (±2 around the index)
+                    start_idx = max(0, idx - 2)
+                    end_idx = min(len(flat_cpu), idx + 3)
+                    
+                    cpu_neighbors = flat_cpu[start_idx:end_idx]
+                    gpu_neighbors = flat_gpu[start_idx:end_idx]
+                    neighbor_indices = list(range(start_idx, end_idx))
+                    
+                    print(f"      [{i}] Index {idx}: diff={deviation:.6e}, CPU={cpu_val:.6f}, GPU={gpu_val:.6f}")
+                    print(f"          Neighboring values (indices {start_idx}-{end_idx-1}):")
+                    print(f"          CPU: {[f'{v:.6f}' for v in cpu_neighbors]}")
+                    print(f"          GPU: {[f'{v:.6f}' for v in gpu_neighbors]}")
+                    print(f"          Idx: {neighbor_indices}")
     
     # Summary
     print(f"\n=== Summary ===")
@@ -235,10 +270,10 @@ def add_all_debug_outputs(ov_model: ov.Model, percentage=100):
     all_ops = ov_model.get_ordered_ops()
     eligible_ops = []
     
-    # Filter eligible operations
-    for op in all_ops:
-        if (op.get_output_size() > 0 and op.get_type_name() not in ['Parameter', 'Constant', 'Result', 'Convolution']):
-            eligible_ops.append(op)
+    # Filter eligible operations and record their original order
+    for idx, op in enumerate(all_ops, 1):
+        if (op.get_output_size() > 0 and op.get_type_name() not in ['Parameter', 'Constant', 'Result', 'Convolution', 'MatMul', 'GroupConvolution']):
+            eligible_ops.append((op, idx))  # Store both op and its order number
     
     print(f"Found {len(eligible_ops)} eligible nodes for debug outputs")
     
@@ -259,15 +294,15 @@ def add_all_debug_outputs(ov_model: ov.Model, percentage=100):
     
     # Add debug outputs for selected nodes
     added_count = 0
-    for idx, op in enumerate(selected_ops, 1):
+    for idx, (op, node_order) in enumerate(selected_ops, 1):
         try:
-            output_name = f"{op.get_friendly_name()}_debug_output"
+            output_name = f"{op.get_friendly_name()}_debug_output_node{node_order}"
             new_result = ov.opset12.result(op.output(0))
             new_result.set_friendly_name(output_name)
             new_result.output(0).set_names({output_name})
             ov_model.add_results([new_result])
             added_count += 1
-            print(f"  [{idx:2d}] Added debug output for: {op.get_friendly_name()} (type: {op.get_type_name()})")
+            print(f"  [{idx:2d}] Added debug output for: {op.get_friendly_name()} (type: {op.get_type_name()}, model node #{node_order})")
         except Exception as e:
             print(f"  [{idx:2d}] Warning: Could not add output for {op.get_friendly_name()}: {e}")
     
