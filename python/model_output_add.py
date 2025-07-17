@@ -1,4 +1,3 @@
-
 import openvino as ov
 import numpy as np
 from openvino import opset8 as opset
@@ -92,9 +91,10 @@ def add_new_output(ov_model: ov.Model, name_list):
 
     return ov_model
 
-def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5):
+def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5, precision="FP32"):
     """Compare outputs of all layers between CPU and GPU devices"""
     print("\n=== Comparing CPU vs GPU outputs for all layers ===")
+    print(f"Using precision: {precision}")
     
     # Collect all model outputs for comparison
     outputs_info = []
@@ -116,14 +116,14 @@ def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5):
     # Compile for CPU and GPU
     print("\nCompiling models...")
     try:
-        cm_cpu = ov.compile_model(ov_model, "CPU", {"INFERENCE_PRECISION_HINT": "FP32"})
+        cm_cpu = ov.compile_model(ov_model, "CPU", {"INFERENCE_PRECISION_HINT": precision})
         print("✓ CPU compilation successful")
     except Exception as e:
         print(f"✗ CPU compilation failed: {e}")
         return
     
     try:
-        cm_gpu = ov.compile_model(ov_model, "GPU", {"INFERENCE_PRECISION_HINT": "FP32"})
+        cm_gpu = ov.compile_model(ov_model, "GPU", {"INFERENCE_PRECISION_HINT": precision})
         print("✓ GPU compilation successful")
     except Exception as e:
         print(f"✗ GPU compilation failed: {e}")
@@ -164,13 +164,20 @@ def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5):
             cpu_out = cpu_outputs[output_name]
             gpu_out = gpu_outputs[output_name]
             
-            # Calculate difference
-            diff = np.abs(cpu_out - gpu_out)
-            max_diff = np.max(diff)
-            mean_diff = np.mean(diff)
+            # Check for NaN or Inf values first
+            cpu_has_nan = np.isnan(cpu_out).any()
+            cpu_has_inf = np.isinf(cpu_out).any()
+            gpu_has_nan = np.isnan(gpu_out).any()
+            gpu_has_inf = np.isinf(gpu_out).any()
             
-            # Check if difference exceeds tolerance
-            is_mismatch = max_diff > tolerance
+            # Calculate difference (handle NaN case)
+            diff = np.abs(cpu_out - gpu_out)
+            max_diff = np.max(diff) if not np.isnan(diff).any() else float('inf')
+            mean_diff = np.mean(diff) if not np.isnan(diff).any() else float('inf')
+            
+            # Check if difference exceeds tolerance or if there are NaN/Inf values
+            has_invalid_values = cpu_has_nan or cpu_has_inf or gpu_has_nan or gpu_has_inf
+            is_mismatch = max_diff > tolerance or has_invalid_values
             
             # Track final output match status
             if is_final_output:
@@ -178,7 +185,59 @@ def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5):
             
             # Use unified formatting for all outputs
             status = "❌ MISMATCH" if is_mismatch else "✅ MATCH"
-            print(f"[{idx:3d}] {status} {layer_name:20s} ({layer_type:15s}){node_order_info} | Max diff: {max_diff:.2e} | Mean diff: {mean_diff:.2e}")
+            
+            # Add warning indicators for invalid values
+            warning_indicators = []
+            if cpu_has_nan or gpu_has_nan:
+                warning_indicators.append("NaN")
+            if cpu_has_inf or gpu_has_inf:
+                warning_indicators.append("Inf")
+            warning_str = f" [{'/'.join(warning_indicators)}]" if warning_indicators else ""
+            
+            print(f"[{idx:3d}] {status} {layer_name:20s} ({layer_type:15s}){node_order_info} | Max diff: {max_diff:.2e} | Mean diff: {mean_diff:.2e}{warning_str}")
+            
+            # Show detailed invalid value information
+            if has_invalid_values:
+                print(f"    ⚠️  Invalid values detected:")
+                if cpu_has_nan:
+                    cpu_nan_count = np.isnan(cpu_out).sum()
+                    print(f"        CPU NaN count: {cpu_nan_count}")
+                if cpu_has_inf:
+                    cpu_inf_count = np.isinf(cpu_out).sum()
+                    print(f"        CPU Inf count: {cpu_inf_count}")
+                if gpu_has_nan:
+                    gpu_nan_count = np.isnan(gpu_out).sum()
+                    print(f"        GPU NaN count: {gpu_nan_count}")
+                if gpu_has_inf:
+                    gpu_inf_count = np.isinf(gpu_out).sum()
+                    print(f"        GPU Inf count: {gpu_inf_count}")
+                
+                # For NaN cases, show CPU sample values for comparison
+                if cpu_has_nan or gpu_has_nan:
+                    print(f"        CPU sample values: {cpu_out.flatten()[:10]}")
+                    if not gpu_has_nan:  # Only show GPU values if they don't contain NaN
+                        print(f"        GPU sample values: {gpu_out.flatten()[:10]}")
+                    else:
+                        # When GPU has NaN, show CPU values at NaN positions
+                        flat_cpu = cpu_out.flatten()
+                        flat_gpu = gpu_out.flatten()
+                        nan_indices = np.where(np.isnan(flat_gpu))[0]
+                        
+                        if len(nan_indices) > 0:
+                            # Show first 10 NaN positions and corresponding CPU values
+                            show_count = min(10, len(nan_indices))
+                            print(f"        GPU NaN positions and corresponding CPU values:")
+                            for i in range(show_count):
+                                idx = nan_indices[i]
+                                cpu_val = flat_cpu[idx]
+                                print(f"          Index {idx}: GPU=nan, CPU={cpu_val:.6f}")
+                            
+                            if len(nan_indices) > 10:
+                                print(f"          ... and {len(nan_indices) - 10} more NaN positions")
+                elif cpu_has_inf or gpu_has_inf:
+                    # For Inf-only cases, show both CPU and GPU sample values
+                    print(f"        CPU sample values: {cpu_out.flatten()[:10]}")
+                    print(f"        GPU sample values: {gpu_out.flatten()[:10]}")
             
             # Track mismatches
             if is_mismatch:
@@ -191,47 +250,64 @@ def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5):
                     'cpu_shape': cpu_out.shape,
                     'gpu_shape': gpu_out.shape,
                     'is_final': is_final_output,
-                    'node_order': node_order_info
+                    'node_order': node_order_info,
+                    'has_nan': cpu_has_nan or gpu_has_nan,
+                    'has_inf': cpu_has_inf or gpu_has_inf
                 }
                 mismatched_layers.append(mismatch_info)
                 
-                # Find and show the location and values with largest deviations
-                flat_cpu = cpu_out.flatten()
-                flat_gpu = gpu_out.flatten()
-                flat_diff = np.abs(flat_cpu - flat_gpu)
-                
-                # Find indices of top 3 largest differences
-                top_diff_indices = np.argsort(flat_diff)[-3:][::-1]  # Get top 3, reverse to largest first
-                
-                print(f"    Top {len(top_diff_indices)} largest deviations:")
-                for i, idx in enumerate(top_diff_indices, 1):
-                    deviation = flat_diff[idx]
-                    cpu_val = flat_cpu[idx]
-                    gpu_val = flat_gpu[idx]
+                # Only show detailed analysis if values are not NaN/Inf
+                if not has_invalid_values:
+                    # Find and show the location and values with largest deviations
+                    flat_cpu = cpu_out.flatten()
+                    flat_gpu = gpu_out.flatten()
+                    flat_diff = np.abs(flat_cpu - flat_gpu)
                     
-                    # Show neighboring values (±2 around the index)
-                    start_idx = max(0, idx - 2)
-                    end_idx = min(len(flat_cpu), idx + 3)
+                    # Find indices of top 3 largest differences
+                    top_diff_indices = np.argsort(flat_diff)[-3:][::-1]  # Get top 3, reverse to largest first
                     
-                    cpu_neighbors = flat_cpu[start_idx:end_idx]
-                    gpu_neighbors = flat_gpu[start_idx:end_idx]
-                    neighbor_indices = list(range(start_idx, end_idx))
-                    
-                    print(f"      [{i}] Index {idx}: diff={deviation:.6e}, CPU={cpu_val:.6f}, GPU={gpu_val:.6f}")
-                    print(f"          Neighboring values (indices {start_idx}-{end_idx-1}):")
-                    print(f"          CPU: {[f'{v:.6f}' for v in cpu_neighbors]}")
-                    print(f"          GPU: {[f'{v:.6f}' for v in gpu_neighbors]}")
-                    print(f"          Idx: {neighbor_indices}")
+                    print(f"    Top {len(top_diff_indices)} largest deviations:")
+                    for i, idx in enumerate(top_diff_indices, 1):
+                        deviation = flat_diff[idx]
+                        cpu_val = flat_cpu[idx]
+                        gpu_val = flat_gpu[idx]
+                        
+                        # Show neighboring values (±2 around the index)
+                        start_idx = max(0, idx - 2)
+                        end_idx = min(len(flat_cpu), idx + 3)
+                        
+                        cpu_neighbors = flat_cpu[start_idx:end_idx]
+                        gpu_neighbors = flat_gpu[start_idx:end_idx]
+                        neighbor_indices = list(range(start_idx, end_idx))
+                        
+                        print(f"      [{i}] Index {idx}: diff={deviation:.6e}, CPU={cpu_val:.6f}, GPU={gpu_val:.6f}")
+                        print(f"          Neighboring values (indices {start_idx}-{end_idx-1}):")
+                        print(f"          CPU: {[f'{v:.6f}' for v in cpu_neighbors]}")
+                        print(f"          GPU: {[f'{v:.6f}' for v in gpu_neighbors]}")
+                        print(f"          Idx: {neighbor_indices}")
+                # Note: For NaN/Inf cases, sample values are not shown to avoid confusion
     
     # Summary
     print(f"\n=== Summary ===")
     print(f"Total outputs compared: {len(outputs_info)}")
     print(f"Total mismatched outputs: {len(mismatched_layers)}")
     
+    # Count different types of issues
+    nan_layers = [x for x in mismatched_layers if x.get('has_nan', False)]
+    inf_layers = [x for x in mismatched_layers if x.get('has_inf', False)]
+    numerical_diff_layers = [x for x in mismatched_layers if not x.get('has_nan', False) and not x.get('has_inf', False)]
+    
+    if nan_layers:
+        print(f"Outputs with NaN values: {len(nan_layers)}")
+    if inf_layers:
+        print(f"Outputs with Inf values: {len(inf_layers)}")
+    if numerical_diff_layers:
+        print(f"Outputs with numerical differences: {len(numerical_diff_layers)}")
+    
     # Check final output status and display overall result
     final_output_mismatch = [x for x in mismatched_layers if x.get('is_final', False)]
-    
-    print(f"\n=== Final Model Output Comparison ===")
+
+    print(f"\n=== Final Model Output Comparison on precision '{precision}' ===")
     if final_output_matches:
         print("🎉 Model final outputs match between CPU and GPU")
         print("✅ Comparison Result: PASS")
@@ -240,13 +316,29 @@ def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5):
         print("❌ Comparison Result: FAIL")
         if final_output_mismatch:
             layer = final_output_mismatch[0]
-            print(f"    Final output mismatch details: {layer['name']} (max_diff: {layer['max_diff']:.2e})")
+            failure_reason = []
+            if layer.get('has_nan', False):
+                failure_reason.append("NaN values")
+            if layer.get('has_inf', False):
+                failure_reason.append("Inf values")
+            if not failure_reason:
+                failure_reason.append(f"numerical difference (max_diff: {layer['max_diff']:.2e})")
+            
+            print(f"    Final output mismatch details: {layer['name']} - {', '.join(failure_reason)}")
     
     debug_mismatches = [x for x in mismatched_layers if x['type'] != "Result" and not x.get('is_final', False)]
     if debug_mismatches:
         print("\n⚠️  Debug outputs with differences:")
         for layer in debug_mismatches:
-            print(f"  - {layer['name']} ({layer['type']}): max_diff={layer['max_diff']:.2e}")
+            issues = []
+            if layer.get('has_nan', False):
+                issues.append("NaN")
+            if layer.get('has_inf', False):
+                issues.append("Inf")
+            if not issues:
+                issues.append(f"max_diff={layer['max_diff']:.2e}")
+            
+            print(f"  - {layer['name']} ({layer['type']}): {', '.join(issues)}")
     
     if not mismatched_layers:
         print("✅ All outputs match within tolerance!")
@@ -272,7 +364,7 @@ def add_all_debug_outputs(ov_model: ov.Model, percentage=100):
     
     # Filter eligible operations and record their original order
     for idx, op in enumerate(all_ops, 1):
-        if (op.get_output_size() > 0 and op.get_type_name() not in ['Parameter', 'Constant', 'Result', 'Convolution', 'MatMul', 'GroupConvolution']):
+        if (op.get_output_size() > 0 and op.get_type_name() not in ['Parameter', 'Constant', 'Result', 'Convolution', 'MatMul', 'GroupConvolution', 'Concat', 'Add', 'Convert', 'Slice', 'ShapeOf', 'Interpolate']):
             eligible_ops.append((op, idx))  # Store both op and its order number
     
     print(f"Found {len(eligible_ops)} eligible nodes for debug outputs")
@@ -328,10 +420,48 @@ def create_simple_test_input(input_shape):
     print(f"Input data statistics: min={np.min(input_data):.6f}, max={np.max(input_data):.6f}, mean={np.mean(input_data):.6f}")
     return input_data
 
+def load_input_data_from_file(file_path, expected_shape):
+    """Load input data from a .npy file and validate its shape"""
+    print(f"\nLoading input data from file: {file_path}")
+    
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Input data file '{file_path}' does not exist.")
+    
+    if not file_path.endswith('.npy'):
+        raise ValueError(f"Input data file must be a .npy file, got: {file_path}")
+    
+    try:
+        input_data = np.load(file_path)
+        print(f"Loaded data shape: {input_data.shape}")
+        print(f"Expected shape: {expected_shape}")
+        
+        # Convert to float32 if needed
+        if input_data.dtype != np.float32:
+            print(f"Converting data from {input_data.dtype} to float32")
+            input_data = input_data.astype(np.float32)
+        
+        # Validate shape
+        if input_data.shape != tuple(expected_shape):
+            print(f"Warning: Loaded data shape {input_data.shape} doesn't match expected shape {expected_shape}")
+            print("Attempting to reshape the data...")
+            
+            # Try to reshape if total elements match
+            if np.prod(input_data.shape) == np.prod(expected_shape):
+                input_data = input_data.reshape(expected_shape)
+                print(f"Successfully reshaped data to {input_data.shape}")
+            else:
+                raise ValueError(f"Cannot reshape data: total elements {np.prod(input_data.shape)} != {np.prod(expected_shape)}")
+        
+        print(f"Input data statistics: min={np.min(input_data):.6f}, max={np.max(input_data):.6f}, mean={np.mean(input_data):.6f}")
+        return input_data
+        
+    except Exception as e:
+        raise RuntimeError(f"Failed to load input data from {file_path}: {e}")
+
 def test():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Add new output to OpenVINO model')
-    parser.add_argument('-i', '--input', type=str, help='Path to input model file (.xml)')
+    parser.add_argument('-m', '--model', type=str, help='Path to input model file (.xml)')
     parser.add_argument('-o', '--output_node', type=str, nargs='*', default=[], 
                         help='Name(s) of the node(s) to add as new output. Can specify multiple nodes separated by spaces.')
     parser.add_argument('-d', '--device', type=str, default='CPU', 
@@ -344,19 +474,23 @@ def test():
                         help='Tolerance for CPU vs GPU comparison (default: 1e-5)')
     parser.add_argument('--simple-input', action='store_true',
                         help='Use simple sequential input data instead of random')
+    parser.add_argument('-i', '--input_data', type=str, default=None,
+                        help='Path to .npy file containing input data. If specified, loads data from file instead of generating it.')
+    parser.add_argument('--precision', type=str, choices=['FP32', 'FP16', 'INT8'], default='FP32',
+                        help='Inference precision hint (default: FP32). Options: FP32, FP16, INT8')
     
     args = parser.parse_args()
     core = ov.Core()
     print(f"Using OpenVINO version: {ov.get_version()}")
     
     # Decide which model to use based on whether model path is provided
-    if args.input:
-        if not os.path.exists(args.input):
-            print(f"Error: Model file '{args.input}' does not exist.")
+    if args.model:
+        if not os.path.exists(args.model):
+            print(f"Error: Model file '{args.model}' does not exist.")
             return
-        
-        print(f"Loading model from: {args.input}")
-        model = core.read_model(args.input)
+
+        print(f"Loading model from: {args.model}")
+        model = core.read_model(args.model)
         print("Model loaded successfully!")
     else:
         print("No input model specified, using default generated model...")
@@ -386,27 +520,33 @@ def test():
         input_shape = model.input(0).get_shape()
         print(f"\n=== Preparing test input for comparison ===")
         
-        if args.simple_input:
+        if args.input_data:
+            # Load input data from file
+            input_data = load_input_data_from_file(args.input_data, input_shape)
+        elif args.simple_input:
             input_data = create_simple_test_input(input_shape)
         else:
             # Use simple sequential data for better reproducibility
             input_data = create_simple_test_input(input_shape)
         
         # Run comparison
-        mismatched_layers = compare_cpu_gpu_outputs(model, input_data, args.tolerance)
+        mismatched_layers = compare_cpu_gpu_outputs(model, input_data, args.tolerance, args.precision)
         
         # Exit after comparison
         return
     
     # Compile model
-    print(f"\n=== Compiling model for device: {args.device}")
-    cm = ov.compile_model(model, args.device)
+    print(f"\n=== Compiling model for device: {args.device} with precision: {args.precision} ===")
+    cm = ov.compile_model(model, args.device, {"INFERENCE_PRECISION_HINT": args.precision})
 
     # Prepare input data
     input_shape = model.input(0).get_shape()
     print(f"\n=== Preparing input data with shape: {input_shape}")
     
-    if args.simple_input:
+    if args.input_data:
+        # Load input data from file
+        input_data = load_input_data_from_file(args.input_data, input_shape)
+    elif args.simple_input:
         input_data = create_simple_test_input(input_shape)
     else:
         input_data = np.random.uniform(low=0, high=255, size=input_shape).astype(np.float32)
