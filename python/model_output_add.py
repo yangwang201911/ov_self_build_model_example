@@ -6,7 +6,7 @@ import utils.common as common_utils
 import argparse
 import os
 
-def my_model():
+def create_simple_model():
     input = opset.parameter([1, 256, 32, 32], Type.f32, name='input')
 
     weight_arr = np.full([1024,256,1,1], 1.5, dtype=np.float32)
@@ -26,7 +26,7 @@ def my_model():
     Result.output(0).set_names({'output'})
     return Model([Result], [input], 'model_add')
 
-def add_new_output(ov_model: ov.Model, name_list):
+def add_debug_output_by_name(ov_model: ov.Model, name_list):
     """
     Add new outputs to the model for specified nodes.
     
@@ -345,7 +345,7 @@ def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5, prec
     
     return mismatched_layers
 
-def add_all_debug_outputs(ov_model: ov.Model, percentage=100):
+def add_debug_outputs_by_percentage(ov_model: ov.Model, percentage=100):
     """Add intermediate layers as debug outputs to the model
     
     Args:
@@ -458,6 +458,340 @@ def load_input_data_from_file(file_path, expected_shape):
     except Exception as e:
         raise RuntimeError(f"Failed to load input data from {file_path}: {e}")
 
+def inspect_node_by_number(ov_model: ov.Model, node_number):
+    """
+    Inspect a specific node by its number and return information about its inputs and outputs.
+    If the node number is out of range, return the original model unchanged.
+    
+    Args:
+        ov_model: OpenVINO model
+        node_number: The sequential number of the node to inspect (1-based indexing)
+    
+    Returns:
+        tuple: (model, node_info) where:
+            - model: The original model (unchanged)
+            - node_info: Dictionary containing node information, or None if node not found
+    """
+    print(f"\n=== Inspecting Node #{node_number} ===")
+    
+    # Get all operation nodes
+    all_ops = ov_model.get_ordered_ops()
+    
+    # Check if node number is valid (1-based indexing)
+    if node_number < 1 or node_number > len(all_ops):
+        print(f"Error: Node number {node_number} is out of range. Valid range: 1-{len(all_ops)}")
+        return ov_model, None
+    
+    # Get the target node (convert to 0-based indexing)
+    target_node = all_ops[node_number - 1]
+    
+    print(f"Found Node #{node_number}: '{target_node.get_friendly_name()}' (type: {target_node.get_type_name()})")
+    
+    # Collect node information
+    node_info = {
+        'node_number': node_number,
+        'friendly_name': target_node.get_friendly_name(),
+        'type_name': target_node.get_type_name(),
+        'inputs': [],
+        'outputs': []
+    }
+    
+    # Analyze inputs
+    print(f"\n--- Node #{node_number} Inputs ---")
+    if target_node.get_input_size() == 0:
+        print("  No inputs (this is likely a Parameter or Constant node)")
+        node_info['inputs'] = []
+    else:
+        for i in range(target_node.get_input_size()):
+            input_port = target_node.input(i)
+            source_output = input_port.get_source_output()
+            source_node = source_output.get_node()
+            
+            input_info = {
+                'input_index': i,
+                'shape': list(input_port.get_shape()),
+                'element_type': str(input_port.get_element_type()),
+                'source_node_name': source_node.get_friendly_name(),
+                'source_node_type': source_node.get_type_name(),
+                'source_output_index': source_output.get_index()
+            }
+            
+            node_info['inputs'].append(input_info)
+            
+            print(f"  Input {i}: shape={input_info['shape']}, type={input_info['element_type']}")
+            print(f"    ↳ Source: {input_info['source_node_name']} ({input_info['source_node_type']}) output[{input_info['source_output_index']}]")
+    
+    # Analyze outputs
+    print(f"\n--- Node #{node_number} Outputs ---")
+    if target_node.get_output_size() == 0:
+        print("  No outputs (this should not happen for valid nodes)")
+        node_info['outputs'] = []
+    else:
+        for i in range(target_node.get_output_size()):
+            output_port = target_node.output(i)
+            
+            output_info = {
+                'output_index': i,
+                'shape': list(output_port.get_shape()),
+                'element_type': str(output_port.get_element_type()),
+                'target_inputs': []
+            }
+            
+            # Find where this output is consumed
+            for target_input in output_port.get_target_inputs():
+                target_node_consumer = target_input.get_node()
+                consumer_info = {
+                    'consumer_node_name': target_node_consumer.get_friendly_name(),
+                    'consumer_node_type': target_node_consumer.get_type_name(),
+                    'consumer_input_index': target_input.get_index()
+                }
+                output_info['target_inputs'].append(consumer_info)
+            
+            node_info['outputs'].append(output_info)
+            
+            print(f"  Output {i}: shape={output_info['shape']}, type={output_info['element_type']}")
+            
+            if output_info['target_inputs']:
+                print(f"    ↳ Consumed by:")
+                for consumer in output_info['target_inputs']:
+                    print(f"      - {consumer['consumer_node_name']} ({consumer['consumer_node_type']}) input[{consumer['consumer_input_index']}]")
+            else:
+                print(f"    ↳ Not consumed by any node (might be a model output)")
+    
+    print(f"\n=== Node #{node_number} Inspection Complete ===")
+    
+    return ov_model, node_info
+
+def add_debug_outputs_with_dependencies_by_number(ov_model: ov.Model, node_numbers, dependency_depth=None):
+    """
+    Add debug outputs for specified nodes and all their input dependency nodes.
+    
+    Args:
+        ov_model: OpenVINO model
+        node_numbers: List of node numbers (1-based indexing) or single integer
+        dependency_depth: Maximum depth of dependency collection. None for unlimited depth.
+                         - depth=0: Only direct input nodes (1 layer)
+                         - depth=1: Direct inputs + their inputs (2 layers)
+                         - depth=N: N+1 layers of dependencies
+    
+    Returns:
+        Modified model with debug outputs added for all specified nodes and their input dependencies
+    """
+    # Convert single integer to list for uniform processing
+    if isinstance(node_numbers, int):
+        node_numbers = [node_numbers]
+    
+    if not node_numbers:
+        print("No node numbers provided, skipping debug output addition.")
+        return ov_model
+    
+    print(f"Target node numbers: {node_numbers}")
+    
+    # Get all operation nodes
+    all_ops = ov_model.get_ordered_ops()
+    total_nodes = len(all_ops)
+    
+    # Validate all node numbers first
+    invalid_nodes = [num for num in node_numbers if num < 1 or num > total_nodes]
+    if invalid_nodes:
+        print(f"Error: Invalid node numbers {invalid_nodes}. Valid range: 1-{total_nodes}")
+        return ov_model
+    
+    # Collect all nodes that need debug outputs (target nodes + their dependencies)
+    nodes_to_debug = set()
+    
+    # Process each target node
+    for node_num in node_numbers:
+        target_node = all_ops[node_num - 1]  # Convert to 0-based indexing
+        
+        print(f"\nProcessing Node #{node_num}: '{target_node.get_friendly_name()}' (type: {target_node.get_type_name()})")
+        
+        # Add the target node itself
+        nodes_to_debug.add(node_num)
+        print(f"  Added target node #{node_num} to debug list")
+        
+        # Recursively collect all input dependency nodes
+        dependency_nodes = set()
+        _collect_input_dependencies(target_node, all_ops, dependency_nodes, dependency_depth)
+        
+        if dependency_nodes:
+            depth_desc = f" (max depth: {dependency_depth})" if dependency_depth is not None else " (unlimited depth)"
+            print(f"  Found {len(dependency_nodes)} input dependency nodes{depth_desc}:")
+            for dep_num in sorted(dependency_nodes):
+                dep_node = all_ops[dep_num - 1]
+                print(f"    Node #{dep_num}: '{dep_node.get_friendly_name()}' ({dep_node.get_type_name()})")
+                nodes_to_debug.add(dep_num)
+        else:
+            print(f"  No input dependency nodes found")
+    
+    # Remove nodes that shouldn't have debug outputs
+    eligible_nodes = set()
+    skipped_nodes = []
+    
+    for node_num in nodes_to_debug:
+        node = all_ops[node_num - 1]
+        
+        # Skip certain node types that typically don't need debug outputs
+        if node.get_type_name() in ['Parameter', 'Constant', 'Result']:
+            skipped_nodes.append((node_num, node.get_friendly_name(), node.get_type_name()))
+            continue
+        
+        # Check if node has outputs
+        if node.get_output_size() == 0:
+            skipped_nodes.append((node_num, node.get_friendly_name(), "No outputs"))
+            continue
+        
+        eligible_nodes.add(node_num)
+    
+    if skipped_nodes:
+        print(f"\nSkipped {len(skipped_nodes)} nodes (not eligible for debug outputs):")
+        for node_num, name, reason in skipped_nodes:
+            print(f"  Node #{node_num}: '{name}' - {reason}")
+    
+    print(f"\nAdding debug outputs for {len(eligible_nodes)} eligible nodes...")
+    
+    # Add debug outputs for all eligible nodes
+    added_count = 0
+    failed_count = 0
+    
+    for node_num in sorted(eligible_nodes):
+        node = all_ops[node_num - 1]
+        
+        try:
+            # Create debug output name with node number for easier identification
+            output_name = f"{node.get_friendly_name()}_debug_output_node{node_num}"
+            
+            # Create new Result node
+            new_result = ov.opset12.result(node.output(0))
+            new_result.set_friendly_name(output_name)
+            new_result.output(0).set_names({output_name})
+            
+            # Add to model
+            ov_model.add_results([new_result])
+            added_count += 1
+            
+            print(f"  ✓ Added debug output for Node #{node_num}: '{node.get_friendly_name()}' ({node.get_type_name()})")
+            
+        except Exception as e:
+            failed_count += 1
+            print(f"  ✗ Failed to add debug output for Node #{node_num}: '{node.get_friendly_name()}' - {e}")
+    
+    print(f"\n=== Debug Output Addition Summary ===")
+    print(f"Target nodes requested: {len(node_numbers)}")
+    print(f"Total dependency nodes found: {len(nodes_to_debug) - len(node_numbers)}")
+    print(f"Eligible nodes for debug outputs: {len(eligible_nodes)}")
+    print(f"Successfully added debug outputs: {added_count}")
+    print(f"Failed to add debug outputs: {failed_count}")
+    print(f"Skipped nodes: {len(skipped_nodes)}")
+    
+    return ov_model
+
+def _collect_input_dependencies(node, all_ops, dependency_nodes, depth=None, visited=None):
+    """
+    Recursively collect all input dependency nodes for a given node.
+    
+    Args:
+        node: The node to analyze
+        all_ops: List of all operations in the model (for node number lookup)
+        dependency_nodes: Set to store dependency node numbers (1-based indexing)
+        depth: Maximum depth of dependency collection. None for unlimited depth.
+               - depth=0: Only direct input nodes (1 layer)
+               - depth=1: Direct inputs + their inputs (2 layers)
+               - depth=N: N+1 layers of dependencies
+        visited: Set of already visited nodes to avoid infinite loops
+    """
+    if visited is None:
+        visited = set()
+    
+    # If depth is 0, we've reached the maximum depth, stop recursion
+    if depth is not None and depth < 0:
+        return
+    
+    # Avoid infinite loops
+    node_id = id(node)
+    if node_id in visited:
+        return
+    visited.add(node_id)
+    
+    # Process all input nodes
+    for i in range(node.get_input_size()):
+        input_port = node.input(i)
+        source_output = input_port.get_source_output()
+        source_node = source_output.get_node()
+        
+        # Find the node number (1-based indexing) in the ordered ops list
+        source_node_number = None
+        for idx, op in enumerate(all_ops, 1):
+            if op is source_node:
+                source_node_number = idx
+                break
+        
+        if source_node_number:
+            dependency_nodes.add(source_node_number)
+            
+            # Recursively collect dependencies of this input node if depth allows
+            if depth is None:
+                # Unlimited depth (original behavior)
+                _collect_input_dependencies(source_node, all_ops, dependency_nodes, depth, visited)
+            elif depth > 0:
+                # Reduce depth by 1 for next level
+                _collect_input_dependencies(source_node, all_ops, dependency_nodes, depth - 1, visited)
+            # If depth == 0, we don't recurse further (only collect direct inputs)
+
+def add_debug_output_by_number(ov_model: ov.Model, node_number):
+    """
+    Add debug output for a specific node by its number.
+    
+    Args:
+        ov_model: OpenVINO model
+        node_number: The sequential number of the node to add debug output for (1-based indexing)
+    
+    Returns:
+        Modified model with debug output added, or original model if node not found/invalid
+    """
+    print(f"\n=== Adding Debug Output for Node #{node_number} ===")
+    
+    # Get all operation nodes
+    all_ops = ov_model.get_ordered_ops()
+    
+    # Check if node number is valid (1-based indexing)
+    if node_number < 1 or node_number > len(all_ops):
+        print(f"Error: Node number {node_number} is out of range. Valid range: 1-{len(all_ops)}")
+        return ov_model
+    
+    # Get the target node (convert to 0-based indexing)
+    target_node = all_ops[node_number - 1]
+    
+    print(f"Target Node #{node_number}: '{target_node.get_friendly_name()}' (type: {target_node.get_type_name()})")
+    
+    # Check if node is eligible for debug output
+    if target_node.get_output_size() == 0:
+        print(f"Warning: Node #{node_number} has no outputs, cannot add debug output")
+        return ov_model
+    
+    if target_node.get_type_name() in ['Parameter', 'Constant', 'Result']:
+        print(f"Warning: Node #{node_number} is a {target_node.get_type_name()} node, typically not used for debug outputs")
+        return ov_model
+    
+    try:
+        # Create debug output name with node number for easier identification
+        output_name = f"{target_node.get_friendly_name()}_debug_output_node{node_number}"
+        
+        # Create new Result node
+        new_result = ov.opset12.result(target_node.output(0))
+        new_result.set_friendly_name(output_name)
+        new_result.output(0).set_names({output_name})
+        
+        # Add to model
+        ov_model.add_results([new_result])
+        
+        print(f"✓ Successfully added debug output: {output_name}")
+        
+    except Exception as e:
+        print(f"✗ Failed to add debug output for Node #{node_number}: {e}")
+    
+    return ov_model
+   
 def test():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Add new output to OpenVINO model')
@@ -478,6 +812,14 @@ def test():
                         help='Path to .npy file containing input data. If specified, loads data from file instead of generating it.')
     parser.add_argument('--precision', type=str, choices=['FP32', 'FP16', 'INT8'], default='FP32',
                         help='Inference precision hint (default: FP32). Options: FP32, FP16, INT8')
+    parser.add_argument('--inspect-node', type=int, default=None,
+                        help='Inspect a specific node by its number (1-based indexing). Shows input/output information for the specified node.')
+    parser.add_argument('--add-debug-node', type=int, default=None,
+                        help='Add debug output for a specific node by its number (1-based indexing).')
+    parser.add_argument('--add-debug-nodes-deps', type=int, nargs='*', default=None,
+                        help='Add debug outputs for specified node numbers and all their input dependencies (1-based indexing). Can specify multiple nodes separated by spaces.')
+    parser.add_argument('--dependency-depth', type=int, default=0,
+                        help='Maximum depth for dependency collection when using --add-debug-nodes-deps. 0=only direct inputs (1 layer), 1=2 layers, etc. If not specified, unlimited depth is used.')
     
     args = parser.parse_args()
     core = ov.Core()
@@ -494,17 +836,36 @@ def test():
         print("Model loaded successfully!")
     else:
         print("No input model specified, using default generated model...")
-        model = my_model()
+        model = create_simple_model()
+
+    # Display original model information
+    print("\n=== Original Model Info ===")
+    common_utils.print_model_info(model)
+    # Check if node inspection is requested
+    if args.inspect_node is not None:
+        print(f"\n=== Node Inspection Mode ===")
+        model, node_info = inspect_node_by_number(model, args.inspect_node)
+        if node_info:
+            print(f"\nNode inspection completed successfully.")
+            print(f"You can use --add-debug-node {args.inspect_node} to add debug output for this node.")
+        return
+    
+    # Check if debug output for specific node is requested
+    if args.add_debug_node is not None:
+        print(f"\n=== Adding Debug Output for Specific Node ===")
+        model = add_debug_output_by_number(model, args.add_debug_node)
+
+    # Check if debug outputs for nodes and dependencies are requested
+    if args.add_debug_nodes_deps is not None:
+        print(f"\n=== Adding Debug Outputs for Nodes and Dependencies ===")
+        model = add_debug_outputs_with_dependencies_by_number(model, args.add_debug_nodes_deps, args.dependency_depth)
 
 
     # Add the specified output nodes if provided
     if args.output_node:
         print(f"Adding specified output nodes: {args.output_node}")
-        model = add_new_output(model, args.output_node)
+        model = add_debug_output_by_name(model, args.output_node)
 
-    # Display original model information
-    print("\n=== Original Model Info ===")
-    common_utils.print_model_info(model)
 
     # If compare mode is enabled, prepare model with debug outputs and run comparison
     if args.compare:
@@ -512,7 +873,7 @@ def test():
         
         # Add debug outputs only if percentage is specified
         if args.debug_percentage is not None:
-            model = add_all_debug_outputs(model, args.debug_percentage)
+            model = add_debug_outputs_by_percentage(model, args.debug_percentage)
         else:
             print("No debug percentage specified, skipping debug output addition.")
         
@@ -566,5 +927,5 @@ def test():
         num_values_to_show = min(10, len(flat_values))
         print(f"===\t First {num_values_to_show} values: {flat_values[:num_values_to_show]}")
     
-if __name__ ==  "__main__":
+if __name__ == "__main__":
     test()
