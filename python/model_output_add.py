@@ -5,6 +5,12 @@ from openvino import Core, Model, Type, Shape, op
 import utils.common as common_utils
 import argparse
 import os
+import time
+import sys
+
+def get_timestamp():
+    """Generate timestamp string for file naming"""
+    return time.strftime("%Y%m%d_%H%M%S")
 
 def create_simple_model():
     input = opset.parameter([1, 256, 32, 32], Type.f32, name='input')
@@ -91,10 +97,18 @@ def add_debug_output_by_name(ov_model: ov.Model, name_list):
 
     return ov_model
 
-def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5, precision="FP32"):
+def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5, precision="FP32", need_dump=False):
     """Compare outputs of all layers between CPU and GPU devices"""
     print("\n=== Comparing CPU vs GPU outputs for all layers ===")
     print(f"Using precision: {precision}")
+    
+    if need_dump:
+        # Create output directory for saving data
+        import time
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        output_dir = f"debug_outputs_{timestamp}"
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"Created output directory: {output_dir}")
     
     # Collect all model outputs for comparison
     outputs_info = []
@@ -170,6 +184,12 @@ def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5, prec
             gpu_has_nan = np.isnan(gpu_out).any()
             gpu_has_inf = np.isinf(gpu_out).any()
             
+            # Calculate min/max values for CPU and GPU outputs
+            cpu_min = np.min(cpu_out) if not (cpu_has_nan or cpu_has_inf) else np.min(cpu_out[np.isfinite(cpu_out)]) if np.any(np.isfinite(cpu_out)) else float('nan')
+            cpu_max = np.max(cpu_out) if not (cpu_has_nan or cpu_has_inf) else np.max(cpu_out[np.isfinite(cpu_out)]) if np.any(np.isfinite(cpu_out)) else float('nan')
+            gpu_min = np.min(gpu_out) if not (gpu_has_nan or gpu_has_inf) else np.min(gpu_out[np.isfinite(gpu_out)]) if np.any(np.isfinite(gpu_out)) else float('nan')
+            gpu_max = np.max(gpu_out) if not (gpu_has_nan or gpu_has_inf) else np.max(gpu_out[np.isfinite(gpu_out)]) if np.any(np.isfinite(gpu_out)) else float('nan')
+            
             # Calculate difference (handle NaN case)
             diff = np.abs(cpu_out - gpu_out)
             max_diff = np.max(diff) if not np.isnan(diff).any() else float('inf')
@@ -195,6 +215,33 @@ def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5, prec
             warning_str = f" [{'/'.join(warning_indicators)}]" if warning_indicators else ""
             
             print(f"[{idx:3d}] {status} {layer_name:20s} ({layer_type:15s}){node_order_info} | Max diff: {max_diff:.2e} | Mean diff: {mean_diff:.2e}{warning_str}")
+            print(f"      CPU: min={cpu_min:.6e}, max={cpu_max:.6e} | GPU: min={gpu_min:.6e}, max={gpu_max:.6e}")
+            
+            # Save output data to files for important nodes (final output, mismatched, or nodes with invalid values)
+            should_save = is_final_output or is_mismatch or has_invalid_values
+            if should_save and need_dump:
+                try:
+                    # Create safe filename from output name
+                    safe_name = "".join(c for c in output_name if c.isalnum() or c in ('_', '-')).rstrip()
+                    if not safe_name:
+                        safe_name = f"output_{idx}"
+                    
+                    # Add shape information to filename
+                    shape_str = "x".join(map(str, cpu_out.shape))
+                    safe_name_with_shape = f"{safe_name}_shape_{shape_str}"
+                    
+                    # Save CPU output
+                    cpu_file = os.path.join(output_dir, f"{safe_name_with_shape}_cpu.npy")
+                    np.save(cpu_file, cpu_out)
+                    
+                    # Save GPU output
+                    gpu_file = os.path.join(output_dir, f"{safe_name_with_shape}_gpu.npy")
+                    np.save(gpu_file, gpu_out)
+                    
+                    print(f"      💾 Saved outputs to: {safe_name_with_shape}_{{cpu,gpu,diff}}.npy")
+                    
+                except Exception as e:
+                    print(f"      ⚠️  Failed to save output data: {e}")
             
             # Show detailed invalid value information
             if has_invalid_values:
@@ -342,6 +389,31 @@ def compare_cpu_gpu_outputs(ov_model: ov.Model, input_data, tolerance=1e-5, prec
     
     if not mismatched_layers:
         print("✅ All outputs match within tolerance!")
+    
+    if need_dump:
+        # Print summary of saved files
+        try:
+            saved_files = [f for f in os.listdir(output_dir) if f.endswith('.npy')]
+            if saved_files:
+                print(f"\n📁 Output Data Files Summary:")
+                print(f"   Directory: {output_dir}")
+                print(f"   Total files saved: {len(saved_files)}")
+
+                # Group files by node
+                node_groups = {}
+                for filename in saved_files:
+                    base_name = filename.rsplit('_', 1)[0]  # Remove _cpu/_gpu/_diff suffix
+                    if base_name not in node_groups:
+                        node_groups[base_name] = []
+                    node_groups[base_name].append(filename)
+
+                print(f"   Nodes with saved outputs: {len(node_groups)}")
+                for node_name, files in sorted(node_groups.items()):
+                    print(f"     - {node_name}: {', '.join(sorted(files))}")
+            else:
+                print(f"\n📁 No output files were saved (all outputs matched within tolerance)")
+        except Exception as e:
+            print(f"\n⚠️  Error accessing output directory: {e}")
     
     return mismatched_layers
 
@@ -792,6 +864,373 @@ def add_debug_output_by_number(ov_model: ov.Model, node_number):
     
     return ov_model
    
+def test_matmul_operation(input1_file, input2_file, device_name, precision, force_matmul_fp32=False):
+    """
+    Test MatMul operation with specified inputs and check for inf values.
+    
+    Args:
+        input1_file: Path to .npy file containing first input data with shape [1,32,256,32]
+        input2_file: Path to .npy file containing second input data with shape [1,32,256,33]
+        device_name: Device to run inference on ('CPU' or 'GPU')
+        precision: Inference precision ('FP16' or 'FP32')
+        force_matmul_fp32: If True, force MatMul nodes to use FP32 precision even when overall precision is FP16
+    
+    Returns:
+        tuple: (has_inf, output_data, inf_count, output_stats)
+    """
+    print(f"\n=== Testing MatMul Operation ===")
+    print(f"Device: {device_name}, Precision: {precision}")
+    print(f"Force MatMul FP32: {force_matmul_fp32}")
+    print(f"Input 1 file: {input1_file}")
+    print(f"Input 2 file: {input2_file}")
+    
+    # Load input data
+    try:
+        input1_data = np.load(input1_file)
+        input2_data = np.load(input2_file)
+        print(f"✓ Loaded input data successfully")
+        print(f"  Input 1 shape: {input1_data.shape}, dtype: {input1_data.dtype}")
+        print(f"  Input 2 shape: {input2_data.shape}, dtype: {input2_data.dtype}")
+    except Exception as e:
+        print(f"✗ Failed to load input data: {e}")
+        return None, None, 0, None
+    
+    # Validate input shapes
+    expected_shape1 = (1, 32, 256, 32)
+    expected_shape2 = (1, 32, 256, 33)
+    
+    if input1_data.shape != expected_shape1:
+        print(f"✗ Input 1 shape mismatch: expected {expected_shape1}, got {input1_data.shape}")
+        return None, None, 0, None
+    
+    if input2_data.shape != expected_shape2:
+        print(f"✗ Input 2 shape mismatch: expected {expected_shape2}, got {input2_data.shape}")
+        return None, None, 0, None
+    
+    # Convert to float32 if needed
+    if input1_data.dtype != np.float32:
+        input1_data = input1_data.astype(np.float32)
+        print(f"  Converted input 1 to float32")
+    
+    if input2_data.dtype != np.float32:
+        input2_data = input2_data.astype(np.float32)
+        print(f"  Converted input 2 to float32")
+    
+    # Check input data for inf/nan values
+    input1_has_inf = np.isinf(input1_data).any()
+    input1_has_nan = np.isnan(input1_data).any()
+    input2_has_inf = np.isinf(input2_data).any()
+    input2_has_nan = np.isnan(input2_data).any()
+    
+    print(f"  Input 1 statistics: min={np.min(input1_data):.6e}, max={np.max(input1_data):.6e}, mean={np.mean(input1_data):.6e}")
+    print(f"  Input 2 statistics: min={np.min(input2_data):.6e}, max={np.max(input2_data):.6e}, mean={np.mean(input2_data):.6e}")
+    
+    if input1_has_inf or input1_has_nan:
+        print(f"⚠️  Input 1 contains invalid values: inf={input1_has_inf}, nan={input1_has_nan}")
+    if input2_has_inf or input2_has_nan:
+        print(f"⚠️  Input 2 contains invalid values: inf={input2_has_inf}, nan={input2_has_nan}")
+    
+    # Create a simple MatMul model
+    print(f"\n--- Creating MatMul Model ---")
+    try:
+        # Create input parameters
+        input1_param = ov.opset12.parameter(expected_shape1, ov.Type.f32, name='input1')
+        input2_param = ov.opset12.parameter(expected_shape2, ov.Type.f32, name='input2')
+        
+        # Create MatMul operation with transpose parameters
+        matmul_op = ov.opset12.matmul(input1_param, input2_param, transpose_a=True, transpose_b=False)
+        matmul_op.set_friendly_name('test_matmul')
+        
+        # Force MatMul to use FP32 precision if requested
+        if force_matmul_fp32:
+            matmul_op.get_rt_info()["precision"] = "FP32"
+            matmul_op.get_rt_info()["keep_precision"] = True
+            print(f"  ✓ Forced MatMul node to use FP32 precision")
+        
+        # Create result
+        result = ov.opset12.result(matmul_op)
+        result.set_friendly_name('matmul_output')
+        result.output(0).set_names({'matmul_output'})
+        
+        # Create model
+        model = ov.Model([result], [input1_param, input2_param], 'test_matmul_model')
+        print(f"✓ Created MatMul model successfully")
+        
+        # Calculate expected output shape
+        # MatMul with transpose_a=True, transpose_b=False:
+        # Input1 [1,32,256,32] transposed -> [1,32,32,256]
+        # Input2 [1,32,256,33] (no transpose)
+        # Result: [1,32,32,256] × [1,32,256,33] -> [1,32,32,33]
+        print(f"  Expected output shape: [1,32,32,33]")
+        print(f"  MatMul configuration: transpose_a=True, transpose_b=False")
+        
+    except Exception as e:
+        print(f"✗ Failed to create MatMul model: {e}")
+        return None, None, 0, None
+    
+    # Compile model
+    print(f"\n--- Compiling Model ---")
+    try:
+        core = ov.Core()
+        
+        # Set precision hint
+        config = {"INFERENCE_PRECISION_HINT": precision}
+        
+        # Additional GPU-specific settings if using GPU
+        if device_name.upper() == 'GPU':
+            # You can add GPU-specific settings here if needed
+            pass
+        
+        compiled_model = core.compile_model(model, device_name, config)
+        print(f"✓ Model compiled successfully for {device_name} with {precision}")
+        
+    except Exception as e:
+        print(f"✗ Failed to compile model for {device_name}: {e}")
+        return None, None, 0, None
+    
+    # Run inference
+    print(f"\n--- Running Inference ---")
+    try:
+        # Prepare input dictionary
+        input_dict = {
+            'input1': input1_data,
+            'input2': input2_data
+        }
+        
+        # Run inference
+        output = compiled_model(input_dict)
+        output_data = output['matmul_output']
+        
+        print(f"✓ Inference completed successfully")
+        print(f"  Output shape: {output_data.shape}")
+        print(f"  Output dtype: {output_data.dtype}")
+        
+    except Exception as e:
+        print(f"✗ Inference failed: {e}")
+        return None, None, 0, None
+    
+    # Analyze output for inf/nan values
+    print(f"\n--- Analyzing Output ---")
+    
+    # Check for inf values
+    has_inf = np.isinf(output_data).any()
+    inf_count = np.isinf(output_data).sum()
+    
+    # Check for nan values
+    has_nan = np.isnan(output_data).any()
+    nan_count = np.isnan(output_data).sum()
+    
+    # Calculate output statistics
+    finite_mask = np.isfinite(output_data)
+    if np.any(finite_mask):
+        output_min = np.min(output_data[finite_mask])
+        output_max = np.max(output_data[finite_mask])
+        output_mean = np.mean(output_data[finite_mask])
+    else:
+        output_min = output_max = output_mean = float('nan')
+    
+    output_stats = {
+        'min': output_min,
+        'max': output_max,
+        'mean': output_mean,
+        'finite_count': np.sum(finite_mask),
+        'total_count': output_data.size
+    }
+    
+    print(f"  Output statistics (finite values only):")
+    print(f"    Min: {output_min:.6e}")
+    print(f"    Max: {output_max:.6e}")
+    print(f"    Mean: {output_mean:.6e}")
+    print(f"    Finite values: {output_stats['finite_count']}/{output_stats['total_count']}")
+    
+    # Report inf/nan status
+    if has_inf:
+        print(f"❌ FOUND INF VALUES: {inf_count} inf values detected in output")
+        
+        # Show some inf positions
+        inf_indices = np.where(np.isinf(output_data))
+        print(f"   Sample inf positions (first 5):")
+        for i in range(min(5, len(inf_indices[0]))):
+            pos = tuple(idx[i] for idx in inf_indices)
+            print(f"     Position {pos}: {output_data[pos]}")
+    else:
+        print(f"✅ NO INF VALUES: Output contains no inf values")
+    
+    if has_nan:
+        print(f"❌ FOUND NAN VALUES: {nan_count} nan values detected in output")
+        
+        # Show some nan positions
+        nan_indices = np.where(np.isnan(output_data))
+        print(f"   Sample nan positions (first 5):")
+        for i in range(min(5, len(nan_indices[0]))):
+            pos = tuple(idx[i] for idx in nan_indices)
+            print(f"     Position {pos}: {output_data[pos]}")
+    else:
+        print(f"✅ NO NAN VALUES: Output contains no nan values")
+    
+    # Save output for debugging if there are issues
+    if has_inf or has_nan:
+        timestamp = get_timestamp()
+        output_file = f"matmul_output_debug_{device_name}_{precision}_{timestamp}.npy"
+        try:
+            np.save(output_file, output_data)
+            print(f"💾 Saved problematic output to: {output_file}")
+        except Exception as e:
+            print(f"⚠️  Failed to save output: {e}")
+    
+    print(f"\n=== MatMul Test Summary ===")
+    print(f"Device: {device_name}, Precision: {precision}")
+    print(f"Inf values found: {has_inf} (count: {inf_count})")
+    print(f"NaN values found: {has_nan} (count: {nan_count})")
+    
+    return has_inf or has_nan, output_data, inf_count + nan_count, output_stats
+
+def test_gpu_fp16_overflow(device_name='GPU', precision='FP16'):
+    """
+    Test device overflow behavior with 2x2 matrices.
+    Creates test matrices that are likely to cause overflow and tests them on specified device with specified precision.
+    
+    Args:
+        device_name: Device to run on ('GPU', 'CPU', etc.)
+        precision: Precision to use ('FP16', 'FP32', etc.)
+    
+    Returns:
+        None (prints results directly)
+    """
+    print(f"\n=== Testing {device_name} {precision} Overflow Behavior ===")
+    
+    # Create 2x2 matrices guaranteed to overflow in FP16
+    # FP16 max value is approximately 65,504
+    # These values will produce results > 65,504 when multiplied
+    input1_2x2 = np.array([[300.0, 300.0], [150.0, 1.0]], dtype=np.float32)
+    input2_2x2 = np.array([[250.0, 250.0], [250.0, 1.0]], dtype=np.float32)
+    
+    print(f"Input 1 (2x2): \n{input1_2x2}")
+    print(f"Input 2 (2x2): \n{input2_2x2}")
+    
+    # Calculate expected result to verify overflow potential
+    expected_result = np.matmul(input1_2x2, input2_2x2)
+    print(f"Expected result: \n{expected_result}")
+    print(f"Expected max value: {np.max(expected_result):.1f} (FP16 max ≈ 65,504)")
+    
+    # Show overflow expectation based on precision
+    if precision == 'FP16':
+        print(f"⚠️  Expected behavior: Values > 65,504 should become 'inf' in FP16")
+    else:
+        print(f"ℹ️  Note: {precision} should handle these values without overflow")
+    
+    try:
+        core = ov.Core()
+        
+        # Create MatMul model
+        print(f"\n--- Creating MatMul Model ---")
+        try:
+            input1_param = ov.opset12.parameter((2, 2), ov.Type.f32, name='input1')
+            input2_param = ov.opset12.parameter((2, 2), ov.Type.f32, name='input2')
+            
+            # Create MatMul operation
+            matmul_op = ov.opset12.matmul(input1_param, input2_param, transpose_a=False, transpose_b=False)
+            matmul_op.set_friendly_name('overflow_test_matmul')
+            
+            result = ov.opset12.result(matmul_op)
+            result.set_friendly_name('matmul_output')
+            result.output(0).set_names({'matmul_output'})
+            
+            model = ov.Model([result], [input1_param, input2_param], 'overflow_test_model')
+            print(f"✓ Created 2x2 MatMul model successfully")
+            
+        except Exception as e:
+            print(f"✗ Failed to create model: {e}")
+            return
+        
+        # Test on specified device with specified precision
+        print(f"\n--- Testing {device_name} {precision} ---")
+        try:
+            compiled_model = core.compile_model(model, device_name, {"INFERENCE_PRECISION_HINT": precision})
+            output = compiled_model({'input1': input1_2x2, 'input2': input2_2x2})['matmul_output']
+            
+            has_inf = np.isinf(output).any()
+            inf_count = np.isinf(output).sum()
+            has_nan = np.isnan(output).any()
+            nan_count = np.isnan(output).sum()
+            
+            output_min = np.min(output[np.isfinite(output)]) if np.any(np.isfinite(output)) else float('nan')
+            output_max = np.max(output[np.isfinite(output)]) if np.any(np.isfinite(output)) else float('nan')
+            
+            print(f"{device_name} {precision} result: \n{output}")
+            print(f"Result shape: {output.shape}")
+            print(f"Values: min={output_min:.1f}, max={output_max:.1f}")
+            print(f"Inf values: {inf_count} ({'Found' if has_inf else 'None'})")
+            print(f"NaN values: {nan_count} ({'Found' if has_nan else 'None'})")
+            
+            # Show overflow positions if found
+            if has_inf and inf_count > 0:
+                inf_indices = np.where(np.isinf(output))
+                print(f"Inf positions:")
+                for i in range(len(inf_indices[0])):
+                    pos = tuple(idx[i] for idx in inf_indices)
+                    print(f"  Position {pos}: {output[pos]}")
+                print(f"🔥 OVERFLOW DETECTED: {device_name} {precision} produced {inf_count} inf values")
+            else:
+                print(f"✅ No overflow detected in {device_name} {precision}")
+
+        except Exception as e:
+            print(f"✗ {device_name} {precision} test failed: {e}")
+            # Check if GPU is available
+            if "GPU" in str(e) or "gpu" in str(e).lower():
+                print(f"   (GPU might not be available on this system)")
+    
+    except Exception as e:
+        print(f"✗ OpenVINO Core initialization failed: {e}")
+        return
+    
+    print(f"\n=== Test Complete ===")
+    print(f"Summary: Tested 2x2 matrix multiplication on {device_name} {precision} with overflow-prone values")
+
+def set_matmul_precision_to_fp32(ov_model: ov.Model):
+    """
+    Set MatMul nodes precision to FP32 to prevent overflow/inf values.
+    
+    Args:
+        ov_model: OpenVINO model to modify
+    
+    Returns:
+        Modified model with MatMul nodes set to FP32 precision
+    """
+    print(f"\n=== Setting MatMul Nodes Precision to FP32 ===")
+    
+    # Get all operation nodes
+    all_ops = ov_model.get_ordered_ops()
+    matmul_nodes = []
+    
+    # Find all MatMul nodes
+    for idx, op in enumerate(all_ops, 1):
+        if op.get_type_name() == 'MatMul':
+            matmul_nodes.append((idx, op))
+            print(f"Found MatMul node #{idx}: '{op.get_friendly_name()}' (type: {op.get_type_name()})")
+    
+    if not matmul_nodes:
+        print("No MatMul nodes found in the model")
+        return ov_model
+    
+    print(f"Found {len(matmul_nodes)} MatMul nodes")
+    
+    # Method 1: Add runtime attributes to force FP32 precision for MatMul nodes
+    modified_count = 0
+    for node_idx, matmul_node in matmul_nodes:
+        try:
+            # Set runtime attribute to force FP32 precision
+            matmul_node.get_rt_info()["precision"] = "FP32"
+            matmul_node.get_rt_info()["keep_precision"] = True
+            
+            print(f"✓ Set MatMul node #{node_idx} '{matmul_node.get_friendly_name()}' precision to FP32")
+            modified_count += 1
+        except Exception as e:
+            print(f"✗ Failed to set precision for MatMul node #{node_idx}: {e}")
+    
+    print(f"Successfully modified {modified_count} MatMul nodes")
+    return ov_model
+
 def test():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Add new output to OpenVINO model')
@@ -819,11 +1258,62 @@ def test():
     parser.add_argument('--add-debug-nodes-deps', type=int, nargs='*', default=None,
                         help='Add debug outputs for specified node numbers and all their input dependencies (1-based indexing). Can specify multiple nodes separated by spaces.')
     parser.add_argument('--dependency-depth', type=int, default=0,
-                        help='Maximum depth for dependency collection when using --add-debug-nodes-deps. 0=only direct inputs (1 layer), 1=2 layers, etc. If not specified, unlimited depth is used.')
+                        help='Maximum depth for dependency collection (default: 0) when using --add-debug-nodes-deps. 0=only direct inputs (1 layer), 1=2 layers, etc.')
+    parser.add_argument('--test-matmul', action='store_true',
+                        help='Test MatMul operation with specified input files and check for inf values')
+    parser.add_argument('--matmul-input1', type=str, default=None,
+                        help='Path to .npy file containing first MatMul input data with shape [1,32,256,32]')
+    parser.add_argument('--matmul-input2', type=str, default=None,
+                        help='Path to .npy file containing second MatMul input data with shape [1,32,256,33]')
+    parser.add_argument('--matmul-device', type=str, choices=['CPU', 'GPU'], default='CPU',
+                        help='Device for MatMul testing (default: CPU)')
+    parser.add_argument('--matmul-precision', type=str, choices=['FP16', 'FP32'], default='FP32',
+                        help='Precision for MatMul testing (default: FP32)')
+    parser.add_argument('--force-matmul-fp32', action='store_true',
+                        help='Force all MatMul nodes to use FP32 precision to prevent overflow')
+    parser.add_argument('--convert-model', action='store_true',
+                        help='Force to prevent overflow')
     
     args = parser.parse_args()
     core = ov.Core()
     print(f"Using OpenVINO version: {ov.get_version()}")
+    
+    # Check if MatMul test mode is requested
+    if args.test_matmul:
+        print(f"\n=== MatMul Test Mode ===")
+        
+        # Validate required arguments
+        if not args.matmul_input1:
+            print("Error: --matmul-input1 is required for MatMul testing")
+            return
+        if not args.matmul_input2:
+            print("Error: --matmul-input2 is required for MatMul testing")
+            return
+        
+        # Check if input files exist
+        if not os.path.exists(args.matmul_input1):
+            print(f"Error: MatMul input 1 file '{args.matmul_input1}' does not exist")
+            return
+        if not os.path.exists(args.matmul_input2):
+            print(f"Error: MatMul input 2 file '{args.matmul_input2}' does not exist")
+            return
+        
+        # Run MatMul test
+        has_invalid, output_data, invalid_count, output_stats = test_matmul_operation(
+            args.matmul_input1, 
+            args.matmul_input2, 
+            args.matmul_device, 
+            args.matmul_precision,
+            args.force_matmul_fp32
+        )
+        
+        # Exit after MatMul test
+        if has_invalid:
+            print(f"\n❌ MatMul test FAILED: Found {invalid_count} invalid values (inf/nan)")
+            sys.exit(1)
+        else:
+            print(f"\n✅ MatMul test PASSED: No invalid values found")
+            sys.exit(0)
     
     # Decide which model to use based on whether model path is provided
     if args.model:
@@ -841,6 +1331,22 @@ def test():
     # Display original model information
     print("\n=== Original Model Info ===")
     common_utils.print_model_info(model)
+    
+    if args.convert_model:
+        from nncf import compress_weights, CompressWeightsMode
+        import copy
+        print("\n=== Converting model to OpenVINO IR format ===")
+        # Convert model to OpenVINO IR format
+        model_int4 = compress_weights(copy.deepcopy(model), mode=CompressWeightsMode.INT4_ASYM)
+        ov.save_model(model_int4, "converted_model_int4.xml")
+        print("Model converted successfully!")
+        return
+
+    # Force MatMul nodes to FP32 if requested
+    if args.force_matmul_fp32:
+        print("\n=== Forcing MatMul nodes to FP32 precision ===")
+        model = set_matmul_precision_to_fp32(model)
+    
     # Check if node inspection is requested
     if args.inspect_node is not None:
         print(f"\n=== Node Inspection Mode ===")
@@ -891,7 +1397,7 @@ def test():
             input_data = create_simple_test_input(input_shape)
         
         # Run comparison
-        mismatched_layers = compare_cpu_gpu_outputs(model, input_data, args.tolerance, args.precision)
+        mismatched_layers = compare_cpu_gpu_outputs(model, input_data, args.tolerance, args.precision, args.add_debug_node is not None)
         
         # Exit after comparison
         return
@@ -929,3 +1435,5 @@ def test():
     
 if __name__ == "__main__":
     test()
+    # Uncomment the line below to run GPU FP16 overflow test directly:
+    # test_gpu_fp16_overflow("CPU", "FP16")
