@@ -114,8 +114,6 @@ def compare_cpu_gpu_outputs(
 
     if need_dump:
         # Create output directory for saving data
-        import time
-
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         output_dir = f"debug_outputs_{timestamp}"
         os.makedirs(output_dir, exist_ok=True)
@@ -169,8 +167,34 @@ def compare_cpu_gpu_outputs(
 
     # Run inference on both devices
     print("\nRunning inference on both devices...")
+    
+    # Measure CPU inference time
+    print("Running CPU inference...")
+    cpu_start_time = time.time()
     cpu_outputs = cm_cpu(input_data)
+    cpu_end_time = time.time()
+    cpu_inference_time = cpu_end_time - cpu_start_time
+    
+    # Measure GPU inference time
+    print("Running GPU inference...")
+    gpu_start_time = time.time()
     gpu_outputs = cm_gpu(input_data)
+    gpu_end_time = time.time()
+    gpu_inference_time = gpu_end_time - gpu_start_time
+    
+    # Display performance information
+    print(f"\n=== Performance Information ===")
+    print(f"CPU inference time: {cpu_inference_time:.4f} seconds ({cpu_inference_time*1000:.2f} ms)")
+    print(f"GPU inference time: {gpu_inference_time:.4f} seconds ({gpu_inference_time*1000:.2f} ms)")
+    
+    if gpu_inference_time > 0:
+        speedup_ratio = cpu_inference_time / gpu_inference_time
+        if speedup_ratio > 1:
+            print(f"GPU is {speedup_ratio:.2f}x faster than CPU")
+        else:
+            print(f"CPU is {1/speedup_ratio:.2f}x faster than GPU")
+    
+    print(f"Inference time difference: {abs(cpu_inference_time - gpu_inference_time):.4f} seconds")
 
     print(f"\n=== Debug: Expected output names from outputs_info ===")
     for layer_name, output_name, layer_type in outputs_info:
@@ -427,6 +451,11 @@ def compare_cpu_gpu_outputs(
     print(f"\n=== Summary ===")
     print(f"Total outputs compared: {len(outputs_info)}")
     print(f"Total mismatched outputs: {len(mismatched_layers)}")
+    
+    # Performance summary
+    print(f"\n=== Performance Summary ===")
+    print(f"CPU inference time: {cpu_inference_time:.4f}s ({cpu_inference_time*1000:.2f}ms)")
+    print(f"GPU inference time: {gpu_inference_time:.4f}s ({gpu_inference_time*1000:.2f}ms)")
 
     # Count different types of issues
     nan_layers = [x for x in mismatched_layers if x.get("has_nan", False)]
@@ -1291,6 +1320,9 @@ def test():
         Compare CPU vs GPU outputs with specified node:
             python model_output_add.py --compare -m /mnt/ywang2/models/mobilesamv2_openvino_model/quantized_image_encoder_ov_model.xml -i /mnt/ywang2/input_image.npy --precision FP16 --add-debug-nodes-deps 784 --dependency-depth 0 -m model.xml
 
+        Compare with MatMul compression disabled:
+            python model_output_add.py --compare -m model.xml -i input.npy --precision FP16 --disable-matmul-compression --debug-percentage 20
+
         Test MatMul operation:
             python model_output_add.py --test-matmul --matmul-input1 input1.npy --matmul-input1-shape [1,256,33,32] --matmul-input2 input2.npy --matmul-input2-shape [1,256,33,32] --matmul-device GPU --matmul-precision FP16
         """,
@@ -1421,6 +1453,11 @@ def test():
         default="[1,32,256,33]",
         help="Expected shape for input 2",
     )
+    parser.add_argument(
+        "--disable-matmul-compression",
+        action="store_true",
+        help="Disable compression for MatMul operations by setting rt_info['precise_0']",
+    )
 
     args = parser.parse_args()
     core = ov.Core()
@@ -1496,6 +1533,29 @@ def test():
     # Display original model information
     print("\n=== Original Model Info ===")
     common_utils.print_model_info(model)
+
+    # Conditionally disable compression for MatMul operations
+    if args.disable_matmul_compression:
+        print(f"\n=== Disable compression for MatMul operations ===")
+        matmul_count = 0
+        for idx, op in enumerate(model.get_ordered_ops(), 1):
+            if op.get_type_name() == "MatMul":
+                # add runtime info for MatMul operations
+                op.rt_info['precise_0'] = ''
+                matmul_count += 1
+                print(f"clear precise_0 for MatMul operation #{idx}: {op.get_friendly_name()}")
+        
+        if matmul_count == 0:
+            print("No MatMul operations found in the model")
+        else:
+            print(f"Disabled compression for {matmul_count} MatMul operations")
+    else:
+        print(f"\n=== MatMul compression settings unchanged ===")
+        matmul_count = sum(1 for op in model.get_ordered_ops() if op.get_type_name() == "MatMul")
+        if matmul_count > 0:
+            print(f"Found {matmul_count} MatMul operations (compression settings not modified)")
+        else:
+            print("No MatMul operations found in the model")
 
     if args.convert_model:
         from nncf import compress_weights, CompressWeightsMode
